@@ -2,7 +2,7 @@
 
 These two workflows contain the encapsulated logic for the lightwave Pipelines CI/CD system.
 
-They are designed to integrate with the [Gruntwork Pipelines CLI](https://github.com/gruntwork-io/pipelines-cli).
+They are designed to integrate with the [lightwave media CLI](https://github.com/lightwave-media/lightwave-cli).
 
 ## Workflows
 
