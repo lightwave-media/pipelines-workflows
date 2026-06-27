@@ -24,12 +24,26 @@ on:
       create_issue_on_drift:
         type: boolean
         default: true
-        description: "Open a GitHub issue when drift is detected"
+        description: "Open a GitHub issue when drift is detected at or above min_severity_for_issue"
+      min_severity_for_issue:
+        type: string
+        default: "high"
+        description: "Minimum severity to open a GitHub issue: acceptable | high | critical"
+      artifact_retention_days:
+        type: number
+        default: 90
+        description: "Days to retain drift report artifacts"
+      sop_path:
+        type: string
+        default: "docs/SOP_DRIFT_DETECTION.md"
+        description: "Repo-relative path to the drift SOP (linked in GitHub issues)"
     secrets:
       INFRASTRUCTURE_CATALOG_TOKEN:
         required: true
       AWS_GITHUB_ACTIONS_ROLE_ARN:
         required: true
+      SLACK_WEBHOOK_URL:
+        required: false
 
 permissions:
   contents: read
@@ -67,7 +81,7 @@ jobs:
           echo "$UNITS" | jq .
 
   plan:
-    name: "Plan — ${{ matrix.unit.path }}"
+    name: "Drift — ${{ matrix.unit.path }}"
     runs-on: ${{ fromJSON(inputs.runner) }}
     needs: discover-units
     if: fromJson(needs.discover-units.outputs.units)[0] != null
@@ -108,48 +122,134 @@ jobs:
         shell: bash
         working-directory: ${{ matrix.unit.path }}
         run: |
+          mkdir -p /tmp/drift/${{ matrix.unit.id }}
           set +e
           terragrunt plan \
             --non-interactive \
             --detailed-exitcode \
-            2>&1 | tee /tmp/drift-output-${{ matrix.unit.id }}.txt
-
+            2>&1 | tee /tmp/drift/${{ matrix.unit.id }}/plan.txt
+          # --detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present
           PLAN_EXIT="${PIPESTATUS[0]}"
-          # exit code 2 = changes present (drift); 0 = no changes; 1 = error
           echo "plan_exit=$PLAN_EXIT" >> "$GITHUB_OUTPUT"
-
-          DRIFTED="false"
-          [[ "$PLAN_EXIT" == "2" ]] && DRIFTED="true"
-          echo "drifted=$DRIFTED" >> "$GITHUB_OUTPUT"
-
-          # Always exit 0 so matrix completes; report job aggregates results
-          exit 0
+          exit 0  # always succeed so all matrix units complete
         env:
           TG_BUCKET_PREFIX: ${{ env.TG_BUCKET_PREFIX }}
 
-      - name: Upload drift output
+      - name: Classify drift severity
+        id: classify
+        shell: bash
+        run: |
+          PLAN_EXIT="${{ steps.plan.outputs.plan_exit }}"
+          PLAN_FILE="/tmp/drift/${{ matrix.unit.id }}/plan.txt"
+
+          if [[ "$PLAN_EXIT" == "1" ]]; then
+            echo "severity=error" >> "$GITHUB_OUTPUT"
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$PLAN_EXIT" == "0" ]]; then
+            echo "severity=none" >> "$GITHUB_OUTPUT"
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # PLAN_EXIT == 2: changes present — classify severity
+          ADD=$(grep -c "will be created" "$PLAN_FILE" 2>/dev/null || echo 0)
+          CHANGE=$(grep -c "will be updated in-place" "$PLAN_FILE" 2>/dev/null || echo 0)
+          DESTROY=$(grep -c "will be destroyed" "$PLAN_FILE" 2>/dev/null || echo 0)
+          REPLACE=$(grep -c "must be replaced" "$PLAN_FILE" 2>/dev/null || echo 0)
+          TOTAL=$((ADD + CHANGE + DESTROY + REPLACE))
+
+          echo "resources_add=$ADD" >> "$GITHUB_OUTPUT"
+          echo "resources_change=$CHANGE" >> "$GITHUB_OUTPUT"
+          echo "resources_destroy=$DESTROY" >> "$GITHUB_OUTPUT"
+          echo "resources_replace=$REPLACE" >> "$GITHUB_OUTPUT"
+          echo "total_changes=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "drifted=true" >> "$GITHUB_OUTPUT"
+
+          # Severity: critical > high > acceptable
+          SEVERITY="acceptable"
+          if [[ $DESTROY -gt 0 || $REPLACE -gt 0 ]]; then
+            SEVERITY="high"
+          fi
+          # Critical: security-related resources destroyed/replaced
+          if grep -qE "aws_security_group|aws_iam_role|aws_iam_policy|aws_kms_key|aws_network_acl" "$PLAN_FILE"; then
+            if grep -qE "will be destroyed|must be replaced" "$PLAN_FILE"; then
+              SEVERITY="critical"
+            fi
+          fi
+
+          echo "severity=$SEVERITY" >> "$GITHUB_OUTPUT"
+
+          # Warning annotation
+          case "$SEVERITY" in
+            critical) echo "::error::Critical drift in ${{ matrix.unit.path }} — security resources affected" ;;
+            high)     echo "::warning::High drift in ${{ matrix.unit.path }} — resources will be destroyed/replaced" ;;
+            *)        echo "::notice::Acceptable drift in ${{ matrix.unit.path }} ($TOTAL change(s))" ;;
+          esac
+
+      - name: Generate JSON report
+        id: report
+        shell: bash
+        run: |
+          SEVERITY="${{ steps.classify.outputs.severity }}"
+          DRIFTED="${{ steps.classify.outputs.drifted }}"
+
+          jq -n \
+            --arg unit "${{ matrix.unit.path }}" \
+            --arg env "${{ inputs.working_directory }}" \
+            --arg region "${{ inputs.aws_region }}" \
+            --arg severity "${SEVERITY:-none}" \
+            --argjson drifted "${DRIFTED:-false}" \
+            --argjson add "${{ steps.classify.outputs.resources_add || 0 }}" \
+            --argjson change "${{ steps.classify.outputs.resources_change || 0 }}" \
+            --argjson destroy "${{ steps.classify.outputs.resources_destroy || 0 }}" \
+            --argjson replace "${{ steps.classify.outputs.resources_replace || 0 }}" \
+            --argjson total "${{ steps.classify.outputs.total_changes || 0 }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              unit: $unit,
+              environment: $env,
+              region: $region,
+              drift_detected: $drifted,
+              drift_severity: $severity,
+              summary: {
+                resources_to_add: $add,
+                resources_to_change: $change,
+                resources_to_destroy: $destroy,
+                resources_to_replace: $replace,
+                total_changes: $total
+              },
+              workflow_run: $run_url
+            }' > /tmp/drift/${{ matrix.unit.id }}/report.json
+
+          cat /tmp/drift/${{ matrix.unit.id }}/report.json
+
+      - name: Upload drift artifacts
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: always()
         with:
-          name: drift-result-${{ matrix.unit.id }}
-          path: /tmp/drift-output-${{ matrix.unit.id }}.txt
-          retention-days: 7
+          name: drift-${{ matrix.unit.id }}
+          path: /tmp/drift/${{ matrix.unit.id }}/
+          retention-days: ${{ inputs.artifact_retention_days }}
           if-no-files-found: ignore
 
       - name: Write drift marker
-        if: steps.plan.outputs.drifted == 'true'
+        if: steps.classify.outputs.drifted == 'true'
         shell: bash
         run: |
           mkdir -p /tmp/drift-markers
-          echo "${{ matrix.unit.path }}" > /tmp/drift-markers/${{ matrix.unit.id }}.drift
-          echo "::warning::Drift detected in ${{ matrix.unit.path }}"
+          # Write JSON summary for aggregation
+          cp /tmp/drift/${{ matrix.unit.id }}/report.json \
+             /tmp/drift-markers/${{ matrix.unit.id }}.json
 
       - name: Upload drift marker
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        if: steps.plan.outputs.drifted == 'true'
+        if: steps.classify.outputs.drifted == 'true'
         with:
           name: drift-marker-${{ matrix.unit.id }}
-          path: /tmp/drift-markers/${{ matrix.unit.id }}.drift
+          path: /tmp/drift-markers/${{ matrix.unit.id }}.json
           retention-days: 1
 
   report:
@@ -166,75 +266,256 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
-      - name: Summarise drift
-        id: summary
+      - name: Aggregate drift results
+        id: aggregate
         shell: bash
         run: |
-          DRIFTED_UNITS=()
-          if ls /tmp/drift-markers/*.drift 2>/dev/null; then
-            while IFS= read -r f; do
-              DRIFTED_UNITS+=("$(cat "$f")")
-            done < <(find /tmp/drift-markers -name "*.drift")
+          MARKERS=(/tmp/drift-markers/*.json)
+          TOTAL_UNITS=0
+          MAX_SEVERITY="none"
+          CRITICAL_UNITS=()
+          HIGH_UNITS=()
+          ACCEPTABLE_UNITS=()
+          TOTAL_ADD=0 TOTAL_CHANGE=0 TOTAL_DESTROY=0 TOTAL_REPLACE=0
+
+          severity_rank() {
+            case "$1" in
+              critical) echo 3 ;;
+              high)     echo 2 ;;
+              acceptable) echo 1 ;;
+              *)        echo 0 ;;
+            esac
+          }
+
+          if ls /tmp/drift-markers/*.json 2>/dev/null; then
+            for f in /tmp/drift-markers/*.json; do
+              [[ -f "$f" ]] || continue
+              TOTAL_UNITS=$((TOTAL_UNITS + 1))
+              UNIT=$(jq -r '.unit' "$f")
+              SEV=$(jq -r '.drift_severity' "$f")
+              ADD=$(jq -r '.summary.resources_to_add' "$f")
+              CHANGE=$(jq -r '.summary.resources_to_change' "$f")
+              DESTROY=$(jq -r '.summary.resources_to_destroy' "$f")
+              REPLACE=$(jq -r '.summary.resources_to_replace' "$f")
+              TOTAL_ADD=$((TOTAL_ADD + ADD))
+              TOTAL_CHANGE=$((TOTAL_CHANGE + CHANGE))
+              TOTAL_DESTROY=$((TOTAL_DESTROY + DESTROY))
+              TOTAL_REPLACE=$((TOTAL_REPLACE + REPLACE))
+              case "$SEV" in
+                critical)   CRITICAL_UNITS+=("$UNIT") ;;
+                high)       HIGH_UNITS+=("$UNIT") ;;
+                acceptable) ACCEPTABLE_UNITS+=("$UNIT") ;;
+              esac
+              if [[ $(severity_rank "$SEV") -gt $(severity_rank "$MAX_SEVERITY") ]]; then
+                MAX_SEVERITY="$SEV"
+              fi
+            done
           fi
 
-          COUNT="${#DRIFTED_UNITS[@]}"
-          echo "drift_count=$COUNT" >> "$GITHUB_OUTPUT"
+          HAS_DRIFT="false"
+          [[ $TOTAL_UNITS -gt 0 ]] && HAS_DRIFT="true"
 
-          if [[ "$COUNT" -gt 0 ]]; then
-            echo "has_drift=true" >> "$GITHUB_OUTPUT"
-            echo "drifted_units<<EOF" >> "$GITHUB_OUTPUT"
-            printf '%s\n' "${DRIFTED_UNITS[@]}" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_drift=false" >> "$GITHUB_OUTPUT"
-          fi
+          TOTAL_CHANGES=$((TOTAL_ADD + TOTAL_CHANGE + TOTAL_DESTROY + TOTAL_REPLACE))
+
+          echo "has_drift=$HAS_DRIFT" >> "$GITHUB_OUTPUT"
+          echo "max_severity=$MAX_SEVERITY" >> "$GITHUB_OUTPUT"
+          echo "drifted_count=$TOTAL_UNITS" >> "$GITHUB_OUTPUT"
+          echo "total_changes=$TOTAL_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "total_add=$TOTAL_ADD" >> "$GITHUB_OUTPUT"
+          echo "total_change=$TOTAL_CHANGE" >> "$GITHUB_OUTPUT"
+          echo "total_destroy=$TOTAL_DESTROY" >> "$GITHUB_OUTPUT"
+          echo "total_replace=$TOTAL_REPLACE" >> "$GITHUB_OUTPUT"
+
+          # Encode unit lists for outputs
+          printf '%s\n' "${CRITICAL_UNITS[@]+"${CRITICAL_UNITS[@]}"}" > /tmp/critical-units.txt
+          printf '%s\n' "${HIGH_UNITS[@]+"${HIGH_UNITS[@]}"}" > /tmp/high-units.txt
+          printf '%s\n' "${ACCEPTABLE_UNITS[@]+"${ACCEPTABLE_UNITS[@]}"}" > /tmp/acceptable-units.txt
+
+          echo "critical_units<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/critical-units.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "high_units<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/high-units.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "acceptable_units<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/acceptable-units.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Write step summary
+        shell: bash
+        run: |
+          SEV="${{ steps.aggregate.outputs.max_severity }}"
+          COUNT="${{ steps.aggregate.outputs.drifted_count }}"
+          TOTAL="${{ steps.aggregate.outputs.total_changes }}"
+
+          case "$SEV" in
+            critical)   BADGE="🚨 CRITICAL" ;;
+            high)       BADGE="⚠️ HIGH" ;;
+            acceptable) BADGE="ℹ️ ACCEPTABLE" ;;
+            *)          BADGE="✅ NONE" ;;
+          esac
 
           echo "## 🔍 Drift Detection Report" >> "$GITHUB_STEP_SUMMARY"
           echo "**Directory:** \`${{ inputs.working_directory }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Overall Severity:** $BADGE" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "$COUNT" -gt 0 ]]; then
-            echo "### ⚠️ Drift Detected in $COUNT unit(s)" >> "$GITHUB_STEP_SUMMARY"
-            printf '%s\n' "${DRIFTED_UNITS[@]}" | while read -r u; do
-              echo "- \`$u\`" >> "$GITHUB_STEP_SUMMARY"
-            done
+          if [[ "${{ steps.aggregate.outputs.has_drift }}" == "true" ]]; then
+            echo "| Change Type | Count |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Resources to Add | ${{ steps.aggregate.outputs.total_add }} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Resources to Update | ${{ steps.aggregate.outputs.total_change }} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Resources to Destroy | ${{ steps.aggregate.outputs.total_destroy }} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Resources to Replace | ${{ steps.aggregate.outputs.total_replace }} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **Total** | **$TOTAL** |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+
+            if [[ -s /tmp/critical-units.txt ]]; then
+              echo "### 🚨 Critical Units" >> "$GITHUB_STEP_SUMMARY"
+              while IFS= read -r u; do echo "- \`$u\`" >> "$GITHUB_STEP_SUMMARY"; done < /tmp/critical-units.txt
+            fi
+            if [[ -s /tmp/high-units.txt ]]; then
+              echo "### ⚠️ High Severity Units" >> "$GITHUB_STEP_SUMMARY"
+              while IFS= read -r u; do echo "- \`$u\`" >> "$GITHUB_STEP_SUMMARY"; done < /tmp/high-units.txt
+            fi
+            if [[ -s /tmp/acceptable-units.txt ]]; then
+              echo "### ℹ️ Acceptable Drift Units" >> "$GITHUB_STEP_SUMMARY"
+              while IFS= read -r u; do echo "- \`$u\`" >> "$GITHUB_STEP_SUMMARY"; done < /tmp/acceptable-units.txt
+            fi
           else
-            echo "### ✅ No drift detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ No drift detected — infrastructure in sync with Terraform state." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Open GitHub issue for drift
-        if: steps.summary.outputs.has_drift == 'true' && inputs.create_issue_on_drift
+        if: |
+          steps.aggregate.outputs.has_drift == 'true' &&
+          inputs.create_issue_on_drift == true &&
+          (steps.aggregate.outputs.max_severity == 'critical' ||
+           steps.aggregate.outputs.max_severity == 'high' ||
+           (steps.aggregate.outputs.max_severity == 'acceptable' && inputs.min_severity_for_issue == 'acceptable'))
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
-            const units = `${{ steps.summary.outputs.drifted_units }}`;
-            const unitList = units.trim().split('\n').map(u => `- \`${u}\``).join('\n');
+            const sev = '${{ steps.aggregate.outputs.max_severity }}';
+            const count = '${{ steps.aggregate.outputs.drifted_count }}';
+            const total = '${{ steps.aggregate.outputs.total_changes }}';
+            const add = '${{ steps.aggregate.outputs.total_add }}';
+            const change = '${{ steps.aggregate.outputs.total_change }}';
+            const destroy = '${{ steps.aggregate.outputs.total_destroy }}';
+            const replace = '${{ steps.aggregate.outputs.total_replace }}';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const sopPath = '${{ inputs.sop_path }}';
+
+            const criticalUnits = `${{ steps.aggregate.outputs.critical_units }}`.trim().split('\n').filter(Boolean);
+            const highUnits = `${{ steps.aggregate.outputs.high_units }}`.trim().split('\n').filter(Boolean);
+            const acceptableUnits = `${{ steps.aggregate.outputs.acceptable_units }}`.trim().split('\n').filter(Boolean);
+
+            const unitSection = (label, units) =>
+              units.length ? `\n### ${label}\n${units.map(u => `- \`${u}\``).join('\n')}` : '';
+
+            const isCritical = sev === 'critical';
+            const emoji = isCritical ? '🚨' : '⚠️';
+            const urgency = isCritical
+              ? '\n> **⚠️ IMMEDIATE ACTION REQUIRED** — security-related resources are affected.\n'
+              : '';
+
             const body = [
-              '## Infrastructure Drift Detected',
+              `## ${emoji} Infrastructure Drift Detected`,
               '',
+              urgency,
               `**Directory:** \`${{ inputs.working_directory }}\``,
-              `**Detected by:** [Run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              `**Severity:** ${sev.toUpperCase()}`,
+              `**Drifted Units:** ${count}`,
+              `**Detected by:** [Run ${{ github.run_id }}](${runUrl})`,
               '',
-              '### Drifted Units',
-              unitList,
+              '### Resource Change Summary',
+              '',
+              '| Change Type | Count |',
+              '|---|---|',
+              `| Resources to Add | ${add} |`,
+              `| Resources to Update | ${change} |`,
+              `| Resources to Destroy | ${destroy} |`,
+              `| Resources to Replace | ${replace} |`,
+              `| **Total** | **${total}** |`,
+              unitSection('🚨 Critical Units', criticalUnits),
+              unitSection('⚠️ High Severity Units', highUnits),
+              unitSection('ℹ️ Acceptable Drift Units', acceptableUnits),
               '',
               '### Next Steps',
+              '',
               '1. Review plan output in the workflow run linked above.',
-              '2. Apply changes via a PR against the infrastructure-live repo.',
-              '3. Close this issue once drift is resolved.',
+              '2. Investigate source of drift — check AWS CloudTrail for recent manual changes.',
+              '3. Classify: intentional (update Terraform code) / accidental (revert via apply) / acceptable (add lifecycle ignore).',
+              `4. Follow remediation procedures in [\`${sopPath}\`](${sopPath}).`,
+              '5. Close this issue once drift is resolved.',
             ].join('\n');
+
+            const labels = ['drift', 'infrastructure'];
+            if (isCritical) labels.push('critical');
 
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `⚠️ Drift detected in ${{ inputs.working_directory }} (${{ steps.summary.outputs.drift_count }} unit(s))`,
+              title: `${emoji} Drift detected in ${{ inputs.working_directory }} — ${sev.toUpperCase()} (${count} unit(s), ${total} change(s))`,
               body,
-              labels: ['drift', 'infrastructure'],
+              labels,
             });
 
+      - name: Send Slack notification
+        if: steps.aggregate.outputs.has_drift == 'true'
+        shell: bash
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "SLACK_WEBHOOK_URL not set — skipping Slack notification"
+            exit 0
+          fi
+
+          SEV="${{ steps.aggregate.outputs.max_severity }}"
+          COUNT="${{ steps.aggregate.outputs.drifted_count }}"
+          TOTAL="${{ steps.aggregate.outputs.total_changes }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          case "$SEV" in
+            critical)   EMOJI="🚨"; COLOR="danger" ;;
+            high)       EMOJI="⚠️"; COLOR="warning" ;;
+            *)          EMOJI="ℹ️"; COLOR="good" ;;
+          esac
+
+          PAYLOAD=$(jq -n \
+            --arg text "${EMOJI} Infrastructure Drift Detected" \
+            --arg color "$COLOR" \
+            --arg env "${{ inputs.working_directory }}" \
+            --arg sev "${SEV^^}" \
+            --arg changes "$TOTAL" \
+            --arg units "$COUNT" \
+            --arg run_url "$RUN_URL" \
+            '{
+              text: $text,
+              attachments: [{
+                color: $color,
+                fields: [
+                  {title: "Directory",       value: $env,      short: true},
+                  {title: "Severity",        value: $sev,      short: true},
+                  {title: "Total Changes",   value: $changes,  short: true},
+                  {title: "Drifted Units",   value: $units,    short: true},
+                  {title: "Workflow",        value: ("<" + $run_url + "|View Run>"), short: false}
+                ]
+              }]
+            }')
+
+          curl -fsSL -X POST -H 'Content-type: application/json' \
+            --data "$PAYLOAD" \
+            "${SLACK_WEBHOOK_URL}" || echo "::warning::Slack notification failed (non-fatal)"
+
       - name: Fail on drift
-        if: steps.summary.outputs.has_drift == 'true'
+        if: steps.aggregate.outputs.has_drift == 'true'
         shell: bash
         run: |
-          echo "❌ Drift detected in ${{ steps.summary.outputs.drift_count }} unit(s)"
+          SEV="${{ steps.aggregate.outputs.max_severity }}"
+          COUNT="${{ steps.aggregate.outputs.drifted_count }}"
+          echo "❌ Drift detected — severity=${SEV^^}, drifted_units=${COUNT}"
           exit 1
