@@ -1,325 +1,240 @@
-name: Pipelines
-run-name: Drift Detection
+name: Drift Detection
+run-name: "Drift Detection — ${{ inputs.working_directory }}"
+
 on:
   workflow_call:
     inputs:
-      # This field can be overriden to customize the runner used for pipelines
-      # workflows.
-      #
-      # IMPORTANT: To use self-hosted runners this workflow must be hosted in
-      # the same GitHub organization as your infra-live repository.
-      # See https://docs.github.com/en/actions/using-workflows/reusing-workflows#using-self-hosted-runners
-      #
-      # The value must be an escaped JSON string that will be decoded to the
-      # jobs.runs-on field
-      # See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idruns-on
-      #
-      # For example:
-      # - A simple github runner: "\"ubuntu-22.04\""
-      # - A list of labels: "[\"self-hosted\", \"linux\"]"
-      # - A map: "{group: \"ubuntu-runners\", labels: \"ubuntu-20.04-16core\"}"
       runner:
         type: string
         default: '"ubuntu-latest"'
-      pipelines_drift_detection_filter:
+        description: "JSON-encoded runner label"
+      working_directory:
         type: string
-        default: ""
-      pipelines_drift_detection_branch:
+        required: true
+        description: "Repo-relative path to the Terragrunt environment dir (e.g. prod/us-east-1)"
+      aws_region:
         type: string
-        default: "drift-detection"
-      api_base_url:
+        default: "us-east-1"
+      tg_bucket_prefix:
         type: string
-        default: "https://api.prod.app.gruntwork.io/api/v1"
-      pipelines_binary_url:
+        default: "lightwave-"
+      cloudflare_ssm_param:
         type: string
-        default: ""
-        description: "Override where we fetch pipelines from, used for internal testing"
-      pipelines_cli_version:
-        type: string
-        default: "v0.55.3"
-        description: "For Gruntwork internal testing - the version of the pipelines CLI to use"
-      pipelines_actions_repo:
-        type: string
-        default: "gruntwork-io/pipelines-actions"
-        description: "Repository to fetch pipelines actions from (e.g. use your org/repo for self-hosted)"
-      pipelines_actions_ref:
-        type: string
-        default: "v4.11.1"
-        description: "For Gruntwork internal testing - the ref of the pipelines actions to use"
-      pipelines_credentials_repo:
-        type: string
-        default: "gruntwork-io/pipelines-credentials"
-        description: "Repository to fetch pipelines credentials from (e.g. use your org/repo for self-hosted)"
-      pipelines_credentials_ref:
-        type: string
-        default: "v2.0.0"
-        description: "For Gruntwork internal testing - the ref of the pipelines credentials to use"
-
+        default: "/lightwave/prod/CLOUDFLARE_API_TOKEN"
+      create_issue_on_drift:
+        type: boolean
+        default: true
+        description: "Open a GitHub issue when drift is detected"
     secrets:
-      PIPELINES_READ_TOKEN:
-        required: false
-      PIPELINES_GRUNTWORK_READ_TOKEN:
-        required: false
-      PIPELINES_CUSTOMER_ORG_READ_TOKEN:
-        required: false
-      PR_CREATE_TOKEN:
-        required: false
+      INFRASTRUCTURE_CATALOG_TOKEN:
+        required: true
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
 env:
-  PIPELINES_CLI_VERSION: ${{ inputs.pipelines_cli_version }}
-  PIPELINES_ACTIONS_REPO: ${{ inputs.pipelines_actions_repo }}
-  PIPELINES_ACTIONS_REF: ${{ inputs.pipelines_actions_ref }}
-  PIPELINES_CREDENTIALS_REPO: ${{ inputs.pipelines_credentials_repo }}
-  PIPELINES_CREDENTIALS_REF: ${{ inputs.pipelines_credentials_ref }}
-  BOILERPLATE_VERSION: v0.5.16
-  GRUNTWORK_INSTALLER_VERSION: v0.0.40
+  TG_BUCKET_PREFIX: ${{ inputs.tg_bucket_prefix }}
+  AWS_REGION: ${{ inputs.aws_region }}
 
 jobs:
-  determine_units:
-    name: Detect Infrastructure Drift
+  discover-units:
+    name: Discover All Units
     runs-on: ${{ fromJSON(inputs.runner) }}
     outputs:
-      units: ${{ steps.determine-units.outputs.pipelines_units }}
+      units: ${{ steps.discover.outputs.units }}
     steps:
-      - name: Record workflow env vars
-        env:
-          PIPELINES_BINARY_URL: ${{ inputs.pipelines_binary_url }}
-        run: |
-          time_now=$(date -u +"%s")
-          echo "PIPELINES_JOB_START_TIME=$time_now" >> $GITHUB_ENV
-          echo "PIPELINES_BINARY_URL=$PIPELINES_BINARY_URL" >> $GITHUB_ENV
-      - name: Checkout Pipelines Credentials
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: pipelines-credentials
-          repository: ${{ env.PIPELINES_CREDENTIALS_REPO }}
-          ref: ${{ env.PIPELINES_CREDENTIALS_REF }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Fetch Pipeline Tokens
-        id: pipelines-tokens
-        uses: ./pipelines-credentials
-        env:
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ secrets.PIPELINES_GRUNTWORK_READ_TOKEN || secrets.PIPELINES_READ_TOKEN }}
-          PIPELINES_CUSTOMER_ORG_READ_TOKEN: ${{ secrets.PIPELINES_CUSTOMER_ORG_READ_TOKEN || secrets.PIPELINES_READ_TOKEN }}
-        with:
-          token_requests: |
-            [
-              {"name": "gruntwork_read", "path": "pipelines-read/gruntwork-io", "fallback_env": "PIPELINES_GRUNTWORK_READ_TOKEN"},
-              {"name": "customer_org_read", "path": "pipelines-read/${{ github.repository_owner }}", "fallback_env": "PIPELINES_CUSTOMER_ORG_READ_TOKEN"}
-            ]
-          api_base_url: ${{ inputs.api_base_url }}
-
-      - name: Checkout Pipelines Actions
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: pipelines-actions
-          repository: ${{ env.PIPELINES_ACTIONS_REPO }}
-          ref: ${{ env.PIPELINES_ACTIONS_REF }}
-          token: ${{ env.PIPELINES_ACTIONS_REPO == 'gruntwork-io/pipelines-actions' && fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read || fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Check out repo code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: infra-live-repo
-          fetch-depth: 0
-          token: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Install Mise
-        id: mise-toml
-        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
-        with:
-          install: true
-          cache: true
-          version: 2026.4.11
-          working_directory: "./infra-live-repo"
-
-      - name: Install Pipelines CLI
-        uses: ./pipelines-actions/.github/actions/pipelines-install
-        with:
-          version: ${{ env.PIPELINES_CLI_VERSION }}
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read }}
-
-      - name: Configure code auth
-        uses: ./pipelines-actions/.github/actions/pipelines-code-auth
-        with:
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read }}
-          PIPELINES_CUSTOMER_ORG_READ_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Determine Units
-        id: determine-units
+      - name: Configure git module auth
         shell: bash
         env:
-          DRIFT_DETECTION_FILTER: ${{ inputs.pipelines_drift_detection_filter }}
-        run: |
-          pipelines drift-detection determine-units --working-directory ./infra-live-repo --filter "$DRIFT_DETECTION_FILTER"
+          INFRASTRUCTURE_CATALOG_TOKEN: ${{ secrets.INFRASTRUCTURE_CATALOG_TOKEN }}
+        run: bash scripts/git-code-auth.sh
 
-  pipelines_drift_detection:
-    if: ${{ fromJSON(needs.determine_units.outputs.units)[0] != null }}
+      - name: Discover all Terragrunt units
+        id: discover
+        shell: bash
+        run: |
+          cd "${{ inputs.working_directory }}"
+          UNITS=$(ROOT_DIR="." bash "${GITHUB_WORKSPACE}/scripts/find-all-units.sh")
+          echo "units=$UNITS" >> "$GITHUB_OUTPUT"
+          COUNT=$(echo "$UNITS" | jq 'length')
+          echo "Discovered $COUNT units:"
+          echo "$UNITS" | jq .
+
+  plan:
+    name: "Plan — ${{ matrix.unit.path }}"
     runs-on: ${{ fromJSON(inputs.runner) }}
-    needs: determine_units
+    needs: discover-units
+    if: fromJson(needs.discover-units.outputs.units)[0] != null
     strategy:
       fail-fast: false
-      max-parallel: 18
       matrix:
-        unit: ${{ fromJSON(needs.determine_units.outputs.units) }}
-    name: Detect Drift in ${{ matrix.unit.path }}
+        unit: ${{ fromJson(needs.discover-units.outputs.units) }}
     steps:
-      - name: Record workflow env vars
-        env:
-          PIPELINES_BINARY_URL: ${{ inputs.pipelines_binary_url }}
-        run: |
-          time_now=$(date -u +"%s")
-          echo "PIPELINES_JOB_START_TIME=$time_now" >> $GITHUB_ENV
-          echo "PIPELINES_BINARY_URL=$PIPELINES_BINARY_URL" >> $GITHUB_ENV
-      - name: Checkout Pipelines Credentials
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: pipelines-credentials
-          repository: ${{ env.PIPELINES_CREDENTIALS_REPO }}
-          ref: ${{ env.PIPELINES_CREDENTIALS_REF }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Fetch Pipeline Tokens
-        id: pipelines-tokens
-        uses: ./pipelines-credentials
-        env:
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ secrets.PIPELINES_GRUNTWORK_READ_TOKEN || secrets.PIPELINES_READ_TOKEN }}
-          PIPELINES_CUSTOMER_ORG_READ_TOKEN: ${{ secrets.PIPELINES_CUSTOMER_ORG_READ_TOKEN || secrets.PIPELINES_READ_TOKEN }}
-        with:
-          token_requests: |
-            [
-              {"name": "gruntwork_read", "path": "pipelines-read/gruntwork-io", "fallback_env": "PIPELINES_GRUNTWORK_READ_TOKEN"},
-              {"name": "customer_org_read", "path": "pipelines-read/${{ github.repository_owner }}", "fallback_env": "PIPELINES_CUSTOMER_ORG_READ_TOKEN"}
-            ]
-          api_base_url: ${{ inputs.api_base_url }}
-
-      - name: Checkout Pipelines Actions
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: pipelines-actions
-          repository: ${{ env.PIPELINES_ACTIONS_REPO }}
-          ref: ${{ env.PIPELINES_ACTIONS_REF }}
-          token: ${{ env.PIPELINES_ACTIONS_REPO == 'gruntwork-io/pipelines-actions' && fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read || fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Check out repo code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: infra-live-repo
-          fetch-depth: 0
-          token: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Install Mise
-        id: mise-toml
-        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
-        with:
-          install: true
-          cache: true
-          version: 2026.4.11
-          working_directory: "./infra-live-repo"
-
-      - name: Install Pipelines CLI
-        uses: ./pipelines-actions/.github/actions/pipelines-install
-        with:
-          version: ${{ env.PIPELINES_CLI_VERSION }}
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read }}
-
-      - name: Configure code auth
-        uses: ./pipelines-actions/.github/actions/pipelines-code-auth
-        with:
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read }}
-          PIPELINES_CUSTOMER_ORG_READ_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Determine Drift
-        id: determine-drift
+      - name: Configure git module auth
         shell: bash
         env:
-          DRIFT_DETECTION_FILTER: ${{ inputs.pipelines_drift_detection_filter }}
-          GH_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-          UNIT_ID: ${{ matrix.unit.id }}
-          UNIT_PATH: ${{ matrix.unit.path }}
-        run: |
-          pipelines drift-detection determine-unit-drift \
-            --working-directory ./infra-live-repo \
-            --unit-path "$UNIT_PATH" \
-            --unit-id "$UNIT_ID" \
-            --filter "$DRIFT_DETECTION_FILTER"
+          INFRASTRUCTURE_CATALOG_TOKEN: ${{ secrets.INFRASTRUCTURE_CATALOG_TOKEN }}
+        run: bash scripts/git-code-auth.sh
 
-      - name: "Upload result"
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - name: Setup toolchain (mise)
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
-          name: drift-detection-unit-${{ matrix.unit.id }}
-          path: infra-live-repo/drift-detection-unit-${{ matrix.unit.id }}
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "GitHubActions-Drift-${{ matrix.unit.id }}"
+
+      - name: Fetch Cloudflare token from SSM
+        shell: bash
+        run: |
+          CLOUDFLARE_API_TOKEN=$(aws ssm get-parameter \
+            --name "${{ inputs.cloudflare_ssm_param }}" \
+            --with-decryption --query Parameter.Value --output text)
+          echo "::add-mask::$CLOUDFLARE_API_TOKEN"
+          echo "CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Terragrunt Plan (drift check)
+        id: plan
+        shell: bash
+        working-directory: ${{ matrix.unit.path }}
+        run: |
+          set +e
+          terragrunt plan \
+            --non-interactive \
+            --detailed-exitcode \
+            2>&1 | tee /tmp/drift-output-${{ matrix.unit.id }}.txt
+
+          PLAN_EXIT="${PIPESTATUS[0]}"
+          # exit code 2 = changes present (drift); 0 = no changes; 1 = error
+          echo "plan_exit=$PLAN_EXIT" >> "$GITHUB_OUTPUT"
+
+          DRIFTED="false"
+          [[ "$PLAN_EXIT" == "2" ]] && DRIFTED="true"
+          echo "drifted=$DRIFTED" >> "$GITHUB_OUTPUT"
+
+          # Always exit 0 so matrix completes; report job aggregates results
+          exit 0
+        env:
+          TG_BUCKET_PREFIX: ${{ env.TG_BUCKET_PREFIX }}
+
+      - name: Upload drift output
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: drift-result-${{ matrix.unit.id }}
+          path: /tmp/drift-output-${{ matrix.unit.id }}.txt
+          retention-days: 7
           if-no-files-found: ignore
-          retention-days: 1
-          overwrite: true
 
-  consolidate_jobs:
-    name: Consolidate Jobs
-    runs-on: ${{ fromJSON(inputs.runner) }}
-    needs: pipelines_drift_detection
-    steps:
-      - name: Record workflow env vars
-        env:
-          PIPELINES_BINARY_URL: ${{ inputs.pipelines_binary_url }}
-        run: |
-          time_now=$(date -u +"%s")
-          echo "PIPELINES_JOB_START_TIME=$time_now" >> $GITHUB_ENV
-          echo "PIPELINES_BINARY_URL=$PIPELINES_BINARY_URL" >> $GITHUB_ENV
-      - name: Checkout Pipelines Credentials
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: pipelines-credentials
-          repository: ${{ env.PIPELINES_CREDENTIALS_REPO }}
-          ref: ${{ env.PIPELINES_CREDENTIALS_REF }}
-
-      - name: Fetch Pipeline Tokens
-        id: pipelines-tokens
-        uses: ./pipelines-credentials
-        env:
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ secrets.PIPELINES_GRUNTWORK_READ_TOKEN || secrets.PIPELINES_READ_TOKEN }}
-          PIPELINES_CUSTOMER_ORG_READ_TOKEN: ${{ secrets.PIPELINES_CUSTOMER_ORG_READ_TOKEN || secrets.PIPELINES_READ_TOKEN }}
-          PR_CREATE_TOKEN: ${{ secrets.PR_CREATE_TOKEN }}
-        with:
-          token_requests: |
-            [
-              {"name": "gruntwork_read", "path": "pipelines-read/gruntwork-io", "fallback_env": "PIPELINES_GRUNTWORK_READ_TOKEN"},
-              {"name": "customer_org_read", "path": "pipelines-read/${{ github.repository_owner }}", "fallback_env": "PIPELINES_CUSTOMER_ORG_READ_TOKEN"},
-              {"name": "propose_infra_change", "path": "propose-infra-change/${{ github.repository_owner }}", "fallback_env": "PR_CREATE_TOKEN"}
-            ]
-          api_base_url: ${{ inputs.api_base_url }}
-
-      - name: Checkout Pipelines Actions
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: pipelines-actions
-          repository: ${{ env.PIPELINES_ACTIONS_REPO }}
-          ref: ${{ env.PIPELINES_ACTIONS_REF }}
-          token: ${{ env.PIPELINES_ACTIONS_REPO == 'gruntwork-io/pipelines-actions' && fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read || fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Check out repo code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          path: infra-live-repo
-          fetch-depth: 0
-          token: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).customer_org_read }}
-
-      - name: Install Pipelines CLI
-        uses: ./pipelines-actions/.github/actions/pipelines-install
-        with:
-          version: ${{ env.PIPELINES_CLI_VERSION }}
-          PIPELINES_GRUNTWORK_READ_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).gruntwork_read }}
-
-      - name: "Consolidate Jobs"
-        id: consolidate-jobs
+      - name: Write drift marker
+        if: steps.plan.outputs.drifted == 'true'
         shell: bash
-        env:
-          AUTHOR_EMAIL: ${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com
-          AUTHOR_NAME: ${{ github.actor }}
-          DRIFT_DETECTION_BRANCH: ${{ inputs.pipelines_drift_detection_branch || 'drift-detection' }}
-          DRIFT_DETECTION_FILTER: ${{ inputs.pipelines_drift_detection_filter }}
-          GH_TOKEN: ${{ fromJson(steps.pipelines-tokens.outputs.tokens_json).propose_infra_change }}
         run: |
-          pipelines drift-detection consolidate-jobs \
-            --working-directory "./infra-live-repo" \
-            --filter "$DRIFT_DETECTION_FILTER" \
-            --branch-name "$DRIFT_DETECTION_BRANCH" \
-            --author-name "$AUTHOR_NAME" \
-            --author-email "$AUTHOR_EMAIL"
+          mkdir -p /tmp/drift-markers
+          echo "${{ matrix.unit.path }}" > /tmp/drift-markers/${{ matrix.unit.id }}.drift
+          echo "::warning::Drift detected in ${{ matrix.unit.path }}"
+
+      - name: Upload drift marker
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: steps.plan.outputs.drifted == 'true'
+        with:
+          name: drift-marker-${{ matrix.unit.id }}
+          path: /tmp/drift-markers/${{ matrix.unit.id }}.drift
+          retention-days: 1
+
+  report:
+    name: Drift Report
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    needs: [discover-units, plan]
+    if: always()
+    steps:
+      - name: Download all drift markers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4.1.8
+        with:
+          pattern: drift-marker-*
+          path: /tmp/drift-markers/
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Summarise drift
+        id: summary
+        shell: bash
+        run: |
+          DRIFTED_UNITS=()
+          if ls /tmp/drift-markers/*.drift 2>/dev/null; then
+            while IFS= read -r f; do
+              DRIFTED_UNITS+=("$(cat "$f")")
+            done < <(find /tmp/drift-markers -name "*.drift")
+          fi
+
+          COUNT="${#DRIFTED_UNITS[@]}"
+          echo "drift_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [[ "$COUNT" -gt 0 ]]; then
+            echo "has_drift=true" >> "$GITHUB_OUTPUT"
+            echo "drifted_units<<EOF" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "${DRIFTED_UNITS[@]}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_drift=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "## 🔍 Drift Detection Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Directory:** \`${{ inputs.working_directory }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$COUNT" -gt 0 ]]; then
+            echo "### ⚠️ Drift Detected in $COUNT unit(s)" >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "${DRIFTED_UNITS[@]}" | while read -r u; do
+              echo "- \`$u\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "### ✅ No drift detected" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open GitHub issue for drift
+        if: steps.summary.outputs.has_drift == 'true' && inputs.create_issue_on_drift
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const units = `${{ steps.summary.outputs.drifted_units }}`;
+            const unitList = units.trim().split('\n').map(u => `- \`${u}\``).join('\n');
+            const body = [
+              '## Infrastructure Drift Detected',
+              '',
+              `**Directory:** \`${{ inputs.working_directory }}\``,
+              `**Detected by:** [Run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              '',
+              '### Drifted Units',
+              unitList,
+              '',
+              '### Next Steps',
+              '1. Review plan output in the workflow run linked above.',
+              '2. Apply changes via a PR against the infrastructure-live repo.',
+              '3. Close this issue once drift is resolved.',
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⚠️ Drift detected in ${{ inputs.working_directory }} (${{ steps.summary.outputs.drift_count }} unit(s))`,
+              body,
+              labels: ['drift', 'infrastructure'],
+            });
+
+      - name: Fail on drift
+        if: steps.summary.outputs.has_drift == 'true'
+        shell: bash
+        run: |
+          echo "❌ Drift detected in ${{ steps.summary.outputs.drift_count }} unit(s)"
+          exit 1
