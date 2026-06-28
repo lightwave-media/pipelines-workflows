@@ -7,14 +7,15 @@
 # Env inputs:
 #   SOURCE_REF  — base ref to diff from (defaults: HEAD^ on main, origin/main on PR)
 #   TARGET_REF  — head ref to diff to   (defaults: HEAD)
-#   ROOT_DIR    — repo root (default: ".")
+#
+# Run from the working_directory you want to scan; only units under the cwd
+# subtree are reported, with repo-root-relative paths.
 #
 # Logic: git diff → each changed file → walk up to nearest dir with terragrunt.hcl
 # (skipping .terragrunt-cache) → deduplicate → emit JSON matrix.
 
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-.}"
 TARGET_REF="${TARGET_REF:-HEAD}"
 
 # Determine SOURCE_REF automatically if not set
@@ -26,6 +27,11 @@ if [[ -z "${SOURCE_REF:-}" ]]; then
   fi
 fi
 
+# Probe against the repo toplevel so it resolves no matter the cwd. git diff
+# emits repo-root-relative paths, and the matrix `path` must stay repo-root-
+# relative because the plan/apply step uses it directly as a working-directory.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
 find_unit_for_file() {
   local file="$1"
   local dir
@@ -36,7 +42,7 @@ find_unit_for_file() {
     if [[ "$dir" == *".terragrunt-cache"* ]]; then
       return
     fi
-    if [[ -f "${ROOT_DIR}/${dir}/terragrunt.hcl" ]]; then
+    if [[ -f "${REPO_ROOT}/${dir}/terragrunt.hcl" ]]; then
       echo "$dir"
       return
     fi
@@ -45,11 +51,11 @@ find_unit_for_file() {
 }
 
 # Get changed files, find their owning unit, deduplicate, emit JSON.
-# --relative makes git emit paths relative to the CURRENT directory (and limits
-# the diff to it). Callers cd into working_directory before invoking this with
-# ROOT_DIR="."; without --relative the repo-root-relative paths never resolve
-# against cwd and no units are ever found.
-git diff --relative --name-only "${SOURCE_REF}" "${TARGET_REF}" 2>/dev/null | \
+# Callers cd into working_directory before invoking this; `-- .` limits the diff
+# to that subtree (so plan-prod only sees prod/us-east-1, etc.) while git still
+# prints repo-root-relative paths — exactly what the matrix needs. jq -c keeps
+# the array on one line so `units=$UNITS` fits GITHUB_OUTPUT.
+git diff --name-only "${SOURCE_REF}" "${TARGET_REF}" -- . 2>/dev/null | \
   while IFS= read -r file; do
     find_unit_for_file "$file"
   done | \
