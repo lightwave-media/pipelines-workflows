@@ -11,6 +11,10 @@
 # Run from the working_directory you want to scan; only units under the cwd
 # subtree are reported, with repo-root-relative paths.
 #
+# Note: there is intentionally no ROOT_DIR override — the unit root is resolved
+# from `git rev-parse --show-toplevel` so probes work from any cwd. Don't re-add
+# ROOT_DIR; it would reintroduce the cwd/path-mismatch bug this script fixes.
+#
 # Logic: git diff → each changed file → walk up to nearest dir with terragrunt.hcl
 # (skipping .terragrunt-cache) → deduplicate → emit JSON matrix.
 
