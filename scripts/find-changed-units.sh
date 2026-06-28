@@ -44,8 +44,12 @@ find_unit_for_file() {
   done
 }
 
-# Get changed files, find their owning unit, deduplicate, emit JSON
-git diff --name-only "${SOURCE_REF}" "${TARGET_REF}" 2>/dev/null | \
+# Get changed files, find their owning unit, deduplicate, emit JSON.
+# --relative makes git emit paths relative to the CURRENT directory (and limits
+# the diff to it). Callers cd into working_directory before invoking this with
+# ROOT_DIR="."; without --relative the repo-root-relative paths never resolve
+# against cwd and no units are ever found.
+git diff --relative --name-only "${SOURCE_REF}" "${TARGET_REF}" 2>/dev/null | \
   while IFS= read -r file; do
     find_unit_for_file "$file"
   done | \
