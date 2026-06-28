@@ -54,7 +54,7 @@ git diff --relative --name-only "${SOURCE_REF}" "${TARGET_REF}" 2>/dev/null | \
     find_unit_for_file "$file"
   done | \
   sort -u | \
-  jq -R -s '
+  jq -c -R -s '
     split("\n")
     | map(select(. != ""))
     | map({
