@@ -17,7 +17,7 @@ find "${ROOT_DIR}" -name "terragrunt.hcl" \
   xargs -I{} dirname {} | \
   sed "s|^${ROOT_DIR}/||" | \
   sort -u | \
-  jq -R -s '
+  jq -c -R -s '
     split("\n")
     | map(select(. != ""))
     | map({
