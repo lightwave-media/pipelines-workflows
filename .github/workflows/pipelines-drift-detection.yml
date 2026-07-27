@@ -106,7 +106,9 @@ jobs:
       - name: Terragrunt Plan (drift check)
         id: plan
         shell: bash
-        working-directory: ${{ matrix.unit.path }}
+        # discover-units cds into inputs.working_directory and emits paths
+        # relative to that dir; plan must re-prefix or cwd misses the unit.
+        working-directory: ${{ inputs.working_directory }}/${{ matrix.unit.path }}
         run: |
           set +e
           terragrunt plan \
@@ -141,8 +143,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p /tmp/drift-markers
-          echo "${{ matrix.unit.path }}" > /tmp/drift-markers/${{ matrix.unit.id }}.drift
-          echo "::warning::Drift detected in ${{ matrix.unit.path }}"
+          echo "${{ inputs.working_directory }}/${{ matrix.unit.path }}" > /tmp/drift-markers/${{ matrix.unit.id }}.drift
+          echo "::warning::Drift detected in ${{ inputs.working_directory }}/${{ matrix.unit.path }}"
 
       - name: Upload drift marker
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
