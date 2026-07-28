@@ -129,11 +129,21 @@ jobs:
         env:
           TG_BUCKET_PREFIX: ${{ env.TG_BUCKET_PREFIX }}
 
+      # Scope artifacts by working_directory so parallel reusable-workflow
+      # calls (e.g. prod/us-east-1 + prod/us-west-2) cannot cross-contaminate
+      # the Drift Report download (artifact names collide on unit id alone).
+      - name: Artifact scope slug
+        id: scope
+        shell: bash
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: echo "slug=${WORKING_DIRECTORY//'/'/-}" >> "$GITHUB_OUTPUT"
+
       - name: Upload drift output
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: always()
         with:
-          name: drift-result-${{ matrix.unit.id }}
+          name: drift-result-${{ steps.scope.outputs.slug }}-${{ matrix.unit.id }}
           path: /tmp/drift-output-${{ matrix.unit.id }}.txt
           retention-days: 7
           if-no-files-found: ignore
@@ -150,7 +160,7 @@ jobs:
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: steps.plan.outputs.drifted == 'true'
         with:
-          name: drift-marker-${{ matrix.unit.id }}
+          name: drift-marker-${{ steps.scope.outputs.slug }}-${{ matrix.unit.id }}
           path: /tmp/drift-markers/${{ matrix.unit.id }}.drift
           retention-days: 1
 
@@ -160,10 +170,17 @@ jobs:
     needs: [discover-units, plan]
     if: always()
     steps:
-      - name: Download all drift markers
+      - name: Artifact scope slug
+        id: scope
+        shell: bash
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: echo "slug=${WORKING_DIRECTORY//'/'/-}" >> "$GITHUB_OUTPUT"
+
+      - name: Download drift markers for this directory only
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4.1.8
         with:
-          pattern: drift-marker-*
+          pattern: drift-marker-${{ steps.scope.outputs.slug }}-*
           path: /tmp/drift-markers/
           merge-multiple: true
         continue-on-error: true
@@ -171,11 +188,16 @@ jobs:
       - name: Summarise drift
         id: summary
         shell: bash
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
         run: |
           DRIFTED_UNITS=()
           if ls /tmp/drift-markers/*.drift 2>/dev/null; then
             while IFS= read -r f; do
-              DRIFTED_UNITS+=("$(cat "$f")")
+              unit="$(cat "$f")"
+              # Defense in depth: ignore markers that escaped from another dir.
+              [[ "$unit" == "$WORKING_DIRECTORY/"* ]] || continue
+              DRIFTED_UNITS+=("$unit")
             done < <(find /tmp/drift-markers -name "*.drift")
           fi
 
@@ -209,12 +231,14 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
+            const dir = `${{ inputs.working_directory }}`;
             const units = `${{ steps.summary.outputs.drifted_units }}`;
             const unitList = units.trim().split('\n').map(u => `- \`${u}\``).join('\n');
+            const title = `⚠️ Drift detected in ${dir} (${{ steps.summary.outputs.drift_count }} unit(s))`;
             const body = [
               '## Infrastructure Drift Detected',
               '',
-              `**Directory:** \`${{ inputs.working_directory }}\``,
+              `**Directory:** \`${dir}\``,
               `**Detected by:** [Run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
               '',
               '### Drifted Units',
@@ -226,10 +250,29 @@ jobs:
               '3. Close this issue once drift is resolved.',
             ].join('\n');
 
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'drift',
+              per_page: 50,
+            });
+            const existing = open.data.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Rechecked by [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).\n\n${unitList}`,
+              });
+              core.info(`Updated existing issue #${existing.number}`);
+              return;
+            }
+
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `⚠️ Drift detected in ${{ inputs.working_directory }} (${{ steps.summary.outputs.drift_count }} unit(s))`,
+              title,
               body,
               labels: ['drift', 'infrastructure'],
             });
