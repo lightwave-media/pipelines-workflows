@@ -1,0 +1,77 @@
+name: release-tauri-app
+
+# Tag → Release (release-core) → Tauri bundles built per-OS and attached to
+# the existing Release. tauri-action uploads into the Release release-core
+# created (it finds it by tag), so notes stay git-cliff's.
+#
+# NOTE: faithful canonical pattern; validated on createOS's migration — the
+# first release path that repo has ever had (release_pipeline.yaml,
+# tauri-app row). Bundle signing secrets are the repo's own.
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+      environment:
+        description: "Optional GitHub Environment gating the build. Empty = no gate"
+        type: string
+        default: ""
+      tauri_project_path:
+        description: "Path containing src-tauri/"
+        type: string
+        default: "."
+
+permissions: {}
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-core.yml
+    permissions:
+      contents: write
+    with:
+      dry_run: ${{ inputs.dry_run }}
+
+  gate:
+    name: Approval gate
+    if: ${{ inputs.environment != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval recorded
+        run: echo "Environment '${{ inputs.environment }}' approval recorded by ${{ github.actor }}."
+
+  bundle:
+    name: Bundle (${{ matrix.os }})
+    needs: [release, gate]
+    if: ${{ always() && needs.release.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') && !inputs.dry_run }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain from the repo's mise.toml
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      - name: Build + attach bundles to the existing Release
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: ${{ inputs.tauri_project_path }}
+          tagName: ${{ needs.release.outputs.tag }}
+          releaseDraft: false
+
+  dry-run-note:
+    name: Dry run — bundles skipped
+    needs: [release]
+    if: ${{ inputs.dry_run && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "dry_run — release-core validated the tag and notes; Tauri bundles skipped."

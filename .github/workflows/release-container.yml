@@ -1,0 +1,103 @@
+name: release-container
+
+# Tag → Release (release-core) → image build + ECR push → repo-defined deploy.
+# The image build/push is standardized here; anything after the push (ECS
+# task-def render, migration task, service rollout) is the repo's own
+# `mise run <deploy_task> -- <version>` — repo-specific logic lives in the
+# repo, executed deterministically by the plane (ci_parity).
+#
+# NOTE: faithful to lightwave-platform's deploy.yml contract (keyless OIDC,
+# ECR, ECS); validated on that repo's migration (release_pipeline.yaml,
+# container row).
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+      environment:
+        description: "Optional GitHub Environment gating the deploy. Empty = no gate"
+        type: string
+        default: ""
+      aws_region:
+        type: string
+        default: "us-east-1"
+      ecr_repository:
+        description: "ECR repository name to push to"
+        type: string
+        required: true
+      deploy_task:
+        description: "mise task run after the push (receives the version as $1). Empty = push only"
+        type: string
+        default: ""
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+
+permissions: {}
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-core.yml
+    permissions:
+      contents: write
+    with:
+      dry_run: ${{ inputs.dry_run }}
+
+  gate:
+    name: Approval gate
+    if: ${{ inputs.environment != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval recorded
+        run: echo "Environment '${{ inputs.environment }}' approval recorded by ${{ github.actor }}."
+
+  deploy:
+    name: Build image + deploy
+    needs: [release, gate]
+    if: ${{ always() && needs.release.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assume AWS role (keyless OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Build + push image tagged with the version
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          ECR_REPO: ${{ inputs.ecr_repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE="${REGISTRY}/${ECR_REPO}:${VERSION}"
+          docker build -t "$IMAGE" .
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry_run — built $IMAGE, skipping push."
+            exit 0
+          fi
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+          docker push "$IMAGE"
+          echo "pushed $IMAGE"
+
+      - name: Toolchain from the repo's mise.toml
+        if: ${{ inputs.deploy_task != '' && !inputs.dry_run }}
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      - name: Repo deploy task
+        if: ${{ inputs.deploy_task != '' && !inputs.dry_run }}
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: mise run ${{ inputs.deploy_task }} -- "$VERSION"

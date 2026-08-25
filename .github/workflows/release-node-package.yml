@@ -1,0 +1,79 @@
+name: release-node-package
+
+# Tag → Release (release-core) → npm publish to GitHub Packages.
+# The tag IS the version: package.json is stamped in the workspace at publish
+# time (`npm version --no-git-tag-version`) and never committed. Toolchain
+# comes from the repo's mise.toml (ci_parity: local and CI resolve the same
+# tools by construction).
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+      environment:
+        description: "Optional GitHub Environment gating the publish. Empty = no gate"
+        type: string
+        default: ""
+      registry:
+        type: string
+        default: "https://npm.pkg.github.com"
+
+permissions: {}
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-core.yml
+    permissions:
+      contents: write
+    with:
+      dry_run: ${{ inputs.dry_run }}
+
+  # Approval gate (lightwave-core publish.yml pattern) — its own job because
+  # a reusable-call job cannot bind an Environment. Skipped when unset.
+  gate:
+    name: Approval gate
+    if: ${{ inputs.environment != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval recorded
+        run: echo "Environment '${{ inputs.environment }}' approval recorded by ${{ github.actor }}."
+
+  publish:
+    name: Publish npm package
+    needs: [release, gate]
+    if: ${{ always() && needs.release.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain from the repo's mise.toml
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          else echo "::error::No lockfile — a release without one is not reproducible."; exit 1
+          fi
+
+      - name: Stamp version from tag and publish
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          REGISTRY: ${{ inputs.registry }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          npm version "$VERSION" --no-git-tag-version
+          npm config set "//${REGISTRY#*://}/:_authToken" "$NODE_AUTH_TOKEN"
+          npm config set registry "$REGISTRY"
+          FLAGS=()
+          [ "$DRY_RUN" = "true" ] && FLAGS+=(--dry-run)
+          npm publish "${FLAGS[@]:-}"

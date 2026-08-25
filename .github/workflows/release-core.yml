@@ -1,0 +1,153 @@
+name: release-core
+
+# The shared spine of every Lightwave release (policy/governance/
+# release_pipeline.yaml in lightwave-core — the stamp this implements).
+#
+# Called by the release-<type> workflows in this repo, never by consumers
+# directly. Given a pushed tag it:
+#   1. validates the tag names a commit reachable from the default branch
+#      (a release of an unmerged commit is not a release, it is an accident);
+#   2. derives the version from the tag (the tag IS the version — module
+#      prefixes like `nulltickets/v1.2.3` are understood);
+#   3. generates release notes with git-cliff from conventional commits since
+#      the previous tag of the same prefix — one config, inlined here, so
+#      every repo's changelog is produced by the same bytes;
+#   4. creates the GitHub Release (or, on dry_run, prints what it would do).
+#
+# Determinism: no floating action refs, no network version lookups, gh CLI
+# from the runner image for the Release call, git-cliff executed at a pinned
+# version through mise. Same tag in, same Release out.
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        description: "Run everything but skip creating the Release"
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease (auto-detected from a -suffix if unset)"
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: "SemVer derived from the tag (no prefix)"
+        value: ${{ jobs.core.outputs.version }}
+      tag:
+        description: "The full tag name"
+        value: ${{ jobs.core.outputs.tag }}
+
+permissions: {}
+
+jobs:
+  core:
+    name: Validate + Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      tag: ${{ steps.derive.outputs.tag }}
+    steps:
+      - name: Checkout (full history — tag ancestry + changelog need it)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Assert the tag is reachable from the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$DEFAULT_BRANCH" --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on ${DEFAULT_BRANCH}. Releases are cut from merged history only."
+            exit 1
+          fi
+          echo "tag commit is on ${DEFAULT_BRANCH}"
+
+      - name: Derive version from tag
+        id: derive
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          # Strip an optional module prefix (`nulltickets/v1.2.3`) then the v.
+          VERSION="${TAG##*/}"
+          VERSION="${VERSION#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag ${TAG} does not end in a SemVer (v<major>.<minor>.<patch>[-pre][+build])."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version $VERSION from tag $TAG"
+
+      - name: Install mise (pins git-cliff below)
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          install: false
+
+      - name: Generate release notes (git-cliff, one org-wide config)
+        id: notes
+        env:
+          TAG: ${{ steps.derive.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # One config for the whole org, inlined so every repo's notes are
+          # produced by identical bytes. Change it here, nowhere else.
+          tee /tmp/cliff.toml > /dev/null <<'CLIFF'
+          [changelog]
+          header = ""
+          body = """
+          {% for group, commits in commits | group_by(attribute="group") %}
+          ### {{ group | upper_first }}
+          {% for commit in commits %}
+          - {{ commit.message | upper_first }} ({{ commit.id | truncate(length=8, end="") }})
+          {%- endfor %}
+          {% endfor %}
+          """
+          footer = ""
+          trim = true
+
+          [git]
+          conventional_commits = true
+          filter_unconventional = false
+          commit_parsers = [
+            { message = "^feat", group = "Features" },
+            { message = "^fix", group = "Bug fixes" },
+            { message = "^perf", group = "Performance" },
+            { message = "^refactor", group = "Refactoring" },
+            { message = "^docs", group = "Documentation" },
+            { message = "^ci|^build", group = "CI & build" },
+            { message = "^test", group = "Tests" },
+            { message = "^chore\\(main\\): release", skip = true },
+            { message = ".*", group = "Other" },
+          ]
+          tag_pattern = "v[0-9].*"
+          CLIFF
+          mise x git-cliff@2.11.0 -- git-cliff --config /tmp/cliff.toml --current --tag "$TAG" -o /tmp/notes.md
+          echo "── notes ──"
+          tee /dev/stderr < /tmp/notes.md > /dev/null
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.derive.outputs.tag }}
+          VERSION: ${{ steps.derive.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          FLAGS=()
+          case "$VERSION" in *-*) FLAGS+=(--prerelease);; esac
+          [ "$PRERELEASE" = "true" ] && FLAGS+=(--prerelease)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG already exists — leaving it (keep-existing; artifact jobs attach to it)."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --notes-file /tmp/notes.md "${FLAGS[@]:-}" --verify-tag
+          fi
+
+      - name: Dry run — Release skipped
+        if: ${{ inputs.dry_run }}
+        run: echo "dry_run — would have created Release ${{ steps.derive.outputs.tag }} with the notes above."

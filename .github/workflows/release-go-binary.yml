@@ -1,0 +1,99 @@
+name: release-go-binary
+
+# Tag → Release (release-core) → GoReleaser build + publish.
+# Mirrors lightwave-cli's proven flow (same action SHAs, same GoReleaser
+# version, same tap-token minting). The repo's .goreleaser.yaml must set
+# `release.mode: keep-existing` — release-core creates the Release with
+# git-cliff notes and GoReleaser attaches artifacts to it.
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+      environment:
+        description: "Optional GitHub Environment gating the publish. Empty = no gate"
+        type: string
+        default: ""
+      goreleaser_version:
+        type: string
+        default: "v2.14.3"
+
+permissions: {}
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-core.yml
+    permissions:
+      contents: write
+    with:
+      dry_run: ${{ inputs.dry_run }}
+
+  gate:
+    name: Approval gate
+    if: ${{ inputs.environment != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval recorded
+        run: echo "Environment '${{ inputs.environment }}' approval recorded by ${{ github.actor }}."
+
+  publish:
+    name: GoReleaser publish
+    needs: [release, gate]
+    if: ${{ always() && needs.release.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # secrets context is not legal in `if` expressions at any level; job env
+      # is, so presence is computed here and tested below.
+      HAS_TAP_APP: ${{ secrets.TAP_APP_ID != '' }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+
+      # Short-lived installation token for the tap-publisher GitHub App,
+      # scoped to homebrew-tap; auto-rotates per run. Only minted when the
+      # repo carries the TAP_APP_* secrets (lightwave-cli does).
+      - name: Mint tap-push token
+        id: tap-token
+        if: ${{ !inputs.dry_run && env.HAS_TAP_APP == 'true' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: lightwave-media
+          repositories: homebrew-tap
+
+      - uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7
+        with:
+          version: ${{ inputs.goreleaser_version }}
+          args: release --clean ${{ inputs.dry_run && '--skip=publish,announce' || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+
+      # Darwin binaries for the repo's own notarization workflow, if any
+      # (lightwave-cli's sign-macos.yml). Harmless when unused; expire in 7d.
+      - name: Upload darwin binaries for notarization
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: lw_darwin_amd64
+          path: dist/*_darwin_amd64*/*
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload darwin/arm64 binaries for notarization
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: lw_darwin_arm64
+          path: dist/*_darwin_arm64*/*
+          retention-days: 7
+          if-no-files-found: ignore
