@@ -76,4 +76,4 @@ jobs:
           npm config set registry "$REGISTRY"
           FLAGS=()
           [ "$DRY_RUN" = "true" ] && FLAGS+=(--dry-run)
-          npm publish "${FLAGS[@]:-}"
+          npm publish "${FLAGS[@]}"

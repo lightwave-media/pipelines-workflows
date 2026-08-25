@@ -144,8 +144,11 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "Release $TAG already exists — leaving it (keep-existing; artifact jobs attach to it)."
           else
+            # "${FLAGS[@]}" on an empty array expands to nothing (bash >= 4.4);
+            # the :- form expanded to one EMPTY STRING positional, which
+            # gh treated as a file pattern: `no matches found for ''`.
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "$TAG" --notes-file /tmp/notes.md "${FLAGS[@]:-}" --verify-tag
+              --title "$TAG" --notes-file /tmp/notes.md --verify-tag "${FLAGS[@]}"
           fi
 
       - name: Dry run — Release skipped
