@@ -13,11 +13,11 @@ ROOT_DIR="${ROOT_DIR:-.}"
 
 find "${ROOT_DIR}" -name "terragrunt.hcl" \
   -not -path "*/.terragrunt-cache/*" \
-  -not -path "*/boilerplate/*" | \
-  xargs -I{} dirname {} | \
+  -not -path "*/boilerplate/*" \
+  -exec dirname {} \; | \
   sed "s|^${ROOT_DIR}/||" | \
   sort -u | \
-  jq -R -s '
+  jq -c -R -s '
     split("\n")
     | map(select(. != ""))
     | map({

@@ -1,0 +1,43 @@
+name: release-only
+
+# Tag → GitHub Release with git-cliff notes, no artifact publish.
+# For repos whose release IS the record: lightwave-core, infra-catalog,
+# lightwave-ai modules, lightwave-sys Phase A — and this repo itself.
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+      environment:
+        description: "Optional GitHub Environment gating the release (e.g. production). Empty = no gate"
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  # Approval gate (lightwave-core publish.yml pattern): a job bound to the
+  # named Environment pauses here until its required reviewers approve.
+  # Skipped entirely when no environment is requested — a reusable-call job
+  # cannot bind an Environment itself, so the gate is its own job.
+  gate:
+    name: Approval gate
+    if: ${{ inputs.environment != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval recorded
+        run: echo "Environment '${{ inputs.environment }}' approval recorded by ${{ github.actor }}."
+
+  release:
+    needs: [gate]
+    # Run when the gate passed OR was skipped (no environment requested);
+    # never when it failed or was cancelled.
+    if: ${{ always() && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
+    uses: ./.github/workflows/release-core.yml
+    permissions:
+      contents: write
+    with:
+      dry_run: ${{ inputs.dry_run }}

@@ -1,0 +1,20 @@
+name: CI
+
+# The plane gates itself with its own parity workflow (dogfood): local
+# `mise run ci` and this run execute the same bytes.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci-mise.yml
+    permissions:
+      contents: read

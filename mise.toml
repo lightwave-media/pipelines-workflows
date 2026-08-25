@@ -1,0 +1,16 @@
+# Toolchain + the ONE CI gate for the plane repo itself.
+# ci_parity (lightwave-core release_pipeline.yaml): GitHub CI runs exactly
+# `mise run ci` via ci-mise.yml — keep every check in this task, never in
+# workflow-only steps.
+
+[tools]
+actionlint = "1.7.7"
+shellcheck = "0.11.0"
+
+[tasks.ci]
+description = "THE CI gate: actionlint over every workflow + shellcheck over scripts/"
+run = """
+SHELLCHECK_OPTS="--severity=warning" actionlint
+shellcheck --severity=warning scripts/*.sh
+echo "plane CI green"
+"""
