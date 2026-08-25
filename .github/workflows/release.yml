@@ -1,0 +1,31 @@
+# Release — pipelines-workflows (the plane releases itself: dogfood)
+# Thin caller per policy/governance/release_pipeline.yaml. Local `uses:` so
+# a tag on this repo exercises the exact workflow bytes it ships.
+#
+# Release: git tag vX.Y.Z && git push origin vX.Y.Z
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the full pipeline for the current ref but skip publish"
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-only.yml
+    permissions:
+      contents: write
+    with:
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}

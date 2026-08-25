@@ -1,0 +1,180 @@
+# =============================================================================
+# Reusable CI workflow — Node.js / TypeScript repos
+#
+# MOVED VERBATIM from lightwave-media/.github (2026-08-25, release-plane
+# consolidation): pipelines-workflows is the ONE plane repo for shared
+# workflows. TRANSITIONAL: ci-mise.yml is the parity target (GitHub runs the
+# repo's own `mise run ci` — release_pipeline.yaml `ci_parity`); this file
+# exists so current consumers re-point without behavior change, then migrate
+# their steps into mise tasks and switch to ci-mise.yml.
+#
+# Stamp: lightwave-core/src/schemas/workflows/strategies/ci-node.yaml
+#
+# Callers:
+#   jobs:
+#     ci:
+#       uses: lightwave-media/pipelines-workflows/.github/workflows/ci-node.yml@<SHA> # vX.Y.Z
+#       with:
+#         browser_tests: true   # default false
+# =============================================================================
+name: CI — Node (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: "Node.js major version"
+        type: string
+        default: "22"
+      package_manager:
+        description: "Package manager CLI (npm | pnpm | bun)"
+        type: string
+        default: "pnpm"
+      build_command:
+        description: "npm/pnpm script name for the build step"
+        type: string
+        default: "build"
+      test_command:
+        description: "npm/pnpm script name for unit + integration tests"
+        type: string
+        default: "test"
+      browser_tests:
+        description: "Also run the Playwright browser-test suite"
+        type: boolean
+        default: false
+      browser_test_command:
+        description: "npm/pnpm script name for the browser-test suite"
+        type: string
+        default: "test:browser"
+      requires_fixture_allowlist:
+        description: "Comma-separated component names allowed to skip render-smoke"
+        type: string
+        default: ""
+      artifact_retention_days:
+        description: "Days to retain test-result artifacts"
+        type: number
+        default: 14
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: Setup pnpm
+        if: inputs.package_manager == 'pnpm'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        run: ${{ inputs.package_manager }} install --frozen-lockfile
+
+      # -----------------------------------------------------------------------
+      - name: Build
+        run: ${{ inputs.package_manager }} run ${{ inputs.build_command }}
+
+      # -----------------------------------------------------------------------
+      - name: Unit + integration tests
+        run: |
+          ${{ inputs.package_manager }} run ${{ inputs.test_command }} \
+            --reporter=junit \
+            --outputFile=test-results/unit/junit.xml
+
+      # -----------------------------------------------------------------------
+      - name: Browser tests (Playwright)
+        if: inputs.browser_tests
+        run: |
+          npx playwright install --with-deps chromium
+          ${{ inputs.package_manager }} run ${{ inputs.browser_test_command }} \
+            --reporter=junit \
+            --outputFile=test-results/browser/junit.xml
+
+      # -----------------------------------------------------------------------
+      - name: Upload test-result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.sha }}
+          path: test-results/
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      - name: Publish job summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { parseString } = require('xml2js');
+            const { promisify } = require('util');
+
+            const parseXml = promisify(parseString);
+            const resultsDir = 'test-results';
+            let summary = '## Test Results\n\n';
+
+            // Parse all JUnit XML files and build a summary table.
+            const suites = [];
+            const xmlFiles = fs.readdirSync(resultsDir, { recursive: true })
+              .filter(f => f.endsWith('junit.xml'))
+              .map(f => path.join(resultsDir, f));
+
+            for (const xmlFile of xmlFiles) {
+              try {
+                const xml = fs.readFileSync(xmlFile, 'utf8');
+                const result = await parseXml(xml);
+                const suite = result.testsuites?.testsuite?.[0] || result.testsuite;
+                if (!suite) continue;
+                const attrs = suite.$ || {};
+                suites.push({
+                  name: path.dirname(xmlFile).replace(resultsDir + '/', ''),
+                  tests: parseInt(attrs.tests || '0'),
+                  failures: parseInt(attrs.failures || '0'),
+                  errors: parseInt(attrs.errors || '0'),
+                  skipped: parseInt(attrs.skipped || '0'),
+                  time: parseFloat(attrs.time || '0').toFixed(2),
+                });
+              } catch (_) {}
+            }
+
+            if (suites.length === 0) {
+              summary += '_No JUnit XML found — tests may not have run or reporter not configured._\n';
+            } else {
+              summary += '| Suite | Tests | Passed | Failed | Skipped | Time |\n';
+              summary += '|---|---|---|---|---|---|\n';
+              for (const s of suites) {
+                const passed = s.tests - s.failures - s.errors - s.skipped;
+                const icon = (s.failures + s.errors) > 0 ? '❌' : '✅';
+                summary += `| ${icon} ${s.name} | ${s.tests} | ${passed} | ${s.failures + s.errors} | ${s.skipped} | ${s.time}s |\n`;
+              }
+            }
+
+            // REQUIRES_FIXTURE diff warning.
+            const allowlist = '${{ inputs.requires_fixture_allowlist }}'
+              .split(',').map(s => s.trim()).filter(Boolean);
+            // (Full impl reads smoke-test skip output; stub for v1.0.0)
+            if (allowlist.length > 0) {
+              summary += `\n> **Note:** REQUIRES_FIXTURE allowlist has ${allowlist.length} entry/entries. Review if smoke-test skips change.\n`;
+            }
+
+            summary += `\n[Download test-results artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+
+            await core.summary.addRaw(summary).write();
+
+      # -----------------------------------------------------------------------
+      - name: Lint + type check
+        run: ${{ inputs.package_manager }} run lint || ${{ inputs.package_manager }} exec tsc --noEmit

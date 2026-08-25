@@ -1,0 +1,49 @@
+name: ci-mise
+
+# THE CI parity workflow (release_pipeline.yaml `ci_parity` in
+# lightwave-core): GitHub CI executes the repo's own `mise run ci` — the
+# exact command a developer or agent runs locally — with toolchains pinned
+# by the repo's mise.toml, so local and remote resolve identical tools by
+# construction. Local green means remote green; the local gate is a real
+# bounce board again.
+#
+# Repos MUST NOT add GitHub-side steps that `mise run ci` does not run.
+# Runner-only extras (browser matrices, OS matrices) are the one sanctioned
+# exception, declared in the repo's release_pipeline.yaml row.
+
+on:
+  workflow_call:
+    inputs:
+      task:
+        description: "mise task to run"
+        type: string
+        default: "ci"
+      runs_on:
+        description: "Runner image"
+        type: string
+        default: "ubuntu-latest"
+      fetch_depth:
+        description: "Checkout depth (0 = full history, for tasks that diff against main)"
+        type: number
+        default: 1
+
+permissions: {}
+
+jobs:
+  ci:
+    # DO NOT RENAME: `CI (mise)` is the branch-protection required context
+    # for every repo on the plane (branch_protection.yaml governs the sets).
+    name: CI (mise)
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.fetch_depth }}
+
+      - name: Toolchain from the repo's mise.toml
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      - name: mise run ${{ inputs.task }}
+        run: mise run ${{ inputs.task }}

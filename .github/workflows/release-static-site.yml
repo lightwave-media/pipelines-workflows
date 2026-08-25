@@ -1,0 +1,83 @@
+name: release-static-site
+
+# Tag → Release (release-core) → build via the repo's mise task → deploy to
+# Cloudflare Pages. Build and unit-test logic stays in the repo's mise.toml
+# (ci_parity); this workflow only orders and executes it.
+#
+# NOTE: faithful to joelschaeffer-site's deploy.yml contract; validated on
+# that repo's migration (release_pipeline.yaml, static-site row).
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+      environment:
+        description: "Optional GitHub Environment gating the deploy. Empty = no gate"
+        type: string
+        default: ""
+      build_task:
+        description: "mise task that produces the site"
+        type: string
+        default: "build"
+      output_dir:
+        description: "Directory the build emits"
+        type: string
+        default: "dist"
+      pages_project:
+        description: "Cloudflare Pages project name"
+        type: string
+        required: true
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+permissions: {}
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-core.yml
+    permissions:
+      contents: write
+    with:
+      dry_run: ${{ inputs.dry_run }}
+
+  gate:
+    name: Approval gate
+    if: ${{ inputs.environment != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval recorded
+        run: echo "Environment '${{ inputs.environment }}' approval recorded by ${{ github.actor }}."
+
+  deploy:
+    name: Build + deploy Pages
+    needs: [release, gate]
+    if: ${{ always() && needs.release.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain from the repo's mise.toml
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      - name: Build
+        run: mise run ${{ inputs.build_task }}
+
+      - name: Deploy to Cloudflare Pages
+        if: ${{ !inputs.dry_run }}
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy ${{ inputs.output_dir }} --project-name=${{ inputs.pages_project }}
+
+      - name: Dry run — deploy skipped
+        if: ${{ inputs.dry_run }}
+        run: echo "dry_run — built ${{ inputs.output_dir }}, skipped Pages deploy."

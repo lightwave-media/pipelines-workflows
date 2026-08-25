@@ -1,23 +1,78 @@
-# Lightwave Pipelines Workflows
+# Lightwave Pipelines — the deterministic plane
 
-Reusable GitHub Actions workflows for Terragrunt CI/CD — no Gruntwork subscription required.
+The ONE repo of shared GitHub Actions workflows for every lightwave-media
+repo: **releases**, **CI**, and **Terragrunt infrastructure**. If a repo runs
+a shared workflow, it comes from here, pinned by SHA — there is no second
+place to look. Contract: `policy/governance/release_pipeline.yaml` in
+lightwave-core (the stamp; this repo is the print).
 
-This library replaces Gruntwork Pipelines (which requires `pipelines-credentials`, a private
-`pipelines-actions` repo, and the commercial `pipelines` CLI) with open-source equivalents:
-`mise` for tooling, AWS OIDC for auth, and shell scripts for change detection.
+**Guarantees**
 
-## Workflows
+- Same tag in → same artifacts out. Consumers pin workflows by **full commit
+  SHA** with a `# vX.Y.Z` comment; floating refs (`@main`, `@v1`) are
+  forbidden.
+- The tag IS the version. No release PRs, no version-bump commits, no
+  committed changelogs — GitHub Releases (git-cliff, one org-wide config
+  inlined in `release-core.yml`) are the canonical changelog.
+- **CI parity**: `ci-mise.yml` runs the repo's own `mise run ci` — the exact
+  command an agent runs locally, toolchains pinned by the repo's mise.toml.
+  Local green means remote green.
+- Failure is a red run on the tag, never silence. `release-core` refuses tags
+  whose commit is not on the default branch.
+- This repo releases itself through its own `release-only` path (dogfood) and
+  gates itself with its own `ci-mise.yml`.
 
-### `pipelines.yml` — PR Plan
+## Release workflows
 
-Called on every pull request. Detects which Terragrunt units changed, fans out one parallel
-plan job per unit, and posts a sticky PR comment per unit with the plan output.
+Every repo owns exactly one `.github/workflows/release.yml`: a thin caller
+(scaffold: `lw scaffold repo-release`) triggered by its tag grammar
+(`v<semver>`, monorepos `<module>/v<semver>`), calling one of:
+
+| Workflow | Artifact | Used by |
+|---|---|---|
+| `release-only.yml` | GitHub Release + notes only | lightwave-core, infra-catalog, lightwave-ai modules, lightwave-sys (Phase A), this repo |
+| `release-node-package.yml` | npm → GitHub Packages | lightwave-ui |
+| `release-go-binary.yml` | GoReleaser (+ homebrew-tap App token) | lightwave-cli |
+| `release-container.yml` | ECR push + repo `mise run <deploy_task>` | lightwave-platform |
+| `release-static-site.yml` | mise build → Cloudflare Pages | joelschaeffer-site |
+| `release-tauri-app.yml` | Tauri bundles attached to the Release | createOS |
+
+All six share `release-core.yml` (tag validation → git-cliff notes → GitHub
+Release, keep-existing so artifact jobs attach). Every type supports
+`dry_run` (everything but publish) and an optional `environment` input that
+binds an approval-gate job to a GitHub Environment with required reviewers.
+
+Releasing is one command:
+
+```bash
+git tag vX.Y.Z && git push origin vX.Y.Z   # or `lw release tag` once shipped
+```
+
+## CI workflows
+
+| Workflow | What it does |
+|---|---|
+| `ci-mise.yml` | **The parity workflow**: checkout → mise (repo's mise.toml) → `mise run ci`. The target state for every repo. |
+| `ci-node.yml` | Transitional — moved verbatim from the org `.github` repo. Consumers re-point here, then migrate steps into mise tasks and switch to `ci-mise.yml`. |
+
+## Terragrunt workflows (unchanged)
+
+Open-source replacements for Gruntwork Pipelines — `mise` for tooling, AWS
+OIDC for auth, shell scripts for change detection. Consumed by
+lightwave-infrastructure-live.
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `pipelines.yml` | PR | plan changed units in parallel, sticky comment per unit |
+| `pipelines-root.yml` | push to main | plan → (Environment approval) → apply |
+| `pipelines-drift-detection.yml` | schedule | plan every unit; open an issue on drift |
+| `pipelines-unlock.yml` | manual | force-unlock state locks |
 
 ```yaml
-# In your infra repo .github/workflows/terragrunt-plan.yml
+# Consumption shape (all workflows):
 jobs:
   plan:
-    uses: lightwave-media/pipelines-workflows/.github/workflows/pipelines.yml@main
+    uses: lightwave-media/pipelines-workflows/.github/workflows/pipelines.yml@<full-SHA> # vX.Y.Z
     with:
       working_directory: non-prod/us-east-1
     secrets:
@@ -25,121 +80,12 @@ jobs:
       AWS_GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
 ```
 
-### `pipelines-root.yml` — Push-to-Main Apply
+## Working on this repo
 
-Called on push to `main`. Plans each changed unit, waits for GitHub Environment approval
-(configurable — use for prod gates), then applies in parallel.
-
-```yaml
-# In your infra repo .github/workflows/terragrunt-apply.yml
-jobs:
-  apply:
-    uses: lightwave-media/pipelines-workflows/.github/workflows/pipelines-root.yml@main
-    with:
-      working_directory: prod/us-east-1
-      environment: production   # GitHub Environment with required reviewers — omit for auto-apply
-    secrets:
-      INFRASTRUCTURE_CATALOG_TOKEN: ${{ secrets.INFRASTRUCTURE_CATALOG_TOKEN }}
-      AWS_GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-```
-
-### `pipelines-drift-detection.yml` — Scheduled Drift Detection
-
-Runs `terragrunt plan --detailed-exitcode` on every unit. Exit code 2 = drift.
-Opens a GitHub issue listing drifted units (set `create_issue_on_drift: false` to disable).
-
-```yaml
-# In your infra repo .github/workflows/drift-detection.yml
-on:
-  schedule:
-    - cron: '0 8 * * 1-5'   # weekdays at 8 AM UTC
-
-jobs:
-  drift:
-    uses: lightwave-media/pipelines-workflows/.github/workflows/pipelines-drift-detection.yml@main
-    with:
-      working_directory: prod/us-east-1
-    secrets:
-      INFRASTRUCTURE_CATALOG_TOKEN: ${{ secrets.INFRASTRUCTURE_CATALOG_TOKEN }}
-      AWS_GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-```
-
-### `pipelines-unlock.yml` — Force-Unlock State
-
-Manual `workflow_dispatch` escape hatch. Unlocks a specific unit (provide `unit_path` +
-`lock_id`) or every unit in the working directory.
-
-```yaml
-# In your infra repo .github/workflows/unlock.yml
-on:
-  workflow_dispatch:
-    inputs:
-      unit_path:
-        description: "Unit to unlock (e.g. vpc). Leave empty for all units."
-      lock_id:
-        description: "Lock ID. Leave empty to auto-detect."
-
-jobs:
-  unlock:
-    uses: lightwave-media/pipelines-workflows/.github/workflows/pipelines-unlock.yml@main
-    with:
-      working_directory: prod/us-east-1
-      unit_path: ${{ inputs.unit_path }}
-      lock_id: ${{ inputs.lock_id }}
-    secrets:
-      INFRASTRUCTURE_CATALOG_TOKEN: ${{ secrets.INFRASTRUCTURE_CATALOG_TOKEN }}
-      AWS_GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
-```
-
-## Inputs reference
-
-All workflows share these common inputs:
-
-| Input | Default | Description |
-|---|---|---|
-| `runner` | `"ubuntu-latest"` | JSON-encoded runner label |
-| `working_directory` | _(required)_ | Repo-relative path to the Terragrunt env dir |
-| `aws_region` | `us-east-1` | AWS region |
-| `tg_bucket_prefix` | `lightwave-` | Prefix for Terragrunt S3 state buckets |
-| `cloudflare_ssm_param` | `/lightwave/prod/CLOUDFLARE_API_TOKEN` | SSM path for Cloudflare token |
-
-`pipelines-root.yml` adds:
-
-| Input | Default | Description |
-|---|---|---|
-| `environment` | _(empty)_ | GitHub Environment name for approval gate; empty = auto-apply |
-
-`pipelines-drift-detection.yml` adds:
-
-| Input | Default | Description |
-|---|---|---|
-| `create_issue_on_drift` | `true` | Open a GitHub issue when drift is detected |
-
-`pipelines-unlock.yml` adds:
-
-| Input | Default | Description |
-|---|---|---|
-| `unit_path` | _(empty)_ | Single unit to unlock; empty = all units |
-| `lock_id` | _(empty)_ | Lock ID to release; empty = auto-detect |
-
-## Required secrets
-
-| Secret | Description |
-|---|---|
-| `INFRASTRUCTURE_CATALOG_TOKEN` | GitHub PAT with read access to `lightwave-infrastructure-catalog` |
-| `AWS_GITHUB_ACTIONS_ROLE_ARN` | ARN of the IAM role GitHub Actions assumes via OIDC |
-
-## How it works
-
-**Change detection** (`scripts/find-changed-units.sh`): `git diff` → for each changed file,
-walk up directory tree until a `terragrunt.hcl` is found → deduplicate → emit JSON matrix
-`[{id, path}]`. On `main` branch diffs `HEAD^..HEAD`; on PRs diffs `origin/main..HEAD`.
-
-**Toolchain**: `jdx/mise-action` reads `mise.toml` from your infra repo root, which pins
-`opentofu` and `terragrunt` versions.
-
-**Auth**: `aws-actions/configure-aws-credentials` with OIDC (`id-token: write`). Cloudflare
-API token is fetched from AWS SSM at runtime and masked immediately.
-
-**Private modules**: `scripts/git-code-auth.sh` configures git URL rewrites so Terragrunt
-can fetch modules from `lightwave-infrastructure-catalog` using the catalog PAT.
+- Local gate = `mise run ci` (actionlint + shellcheck) — the same bytes the
+  CI run executes, via this repo's own `ci-mise.yml`.
+- Release a new plane version: `git tag vX.Y.Z && git push origin vX.Y.Z`,
+  then bump consumers' SHA pins (`# vX.Y.Z` comment alongside).
+- History: this repo began as the open-source rewrite of Gruntwork Pipelines
+  (PR #1) and was commissioned as the org-wide release plane 2026-08-25
+  (release-please retired org-wide; see release_pipeline.yaml for why).
