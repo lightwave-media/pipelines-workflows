@@ -293,7 +293,6 @@ jobs:
         env:
           WORKING_DIRECTORY: ${{ inputs.working_directory }}
         run: |
-          MARKERS=(/tmp/drift-markers/*.json)
           TOTAL_UNITS=0
           MAX_SEVERITY="none"
           CRITICAL_UNITS=()
@@ -373,7 +372,6 @@ jobs:
         shell: bash
         run: |
           SEV="${{ steps.aggregate.outputs.max_severity }}"
-          COUNT="${{ steps.aggregate.outputs.drifted_count }}"
           TOTAL="${{ steps.aggregate.outputs.total_changes }}"
 
           case "$SEV" in
