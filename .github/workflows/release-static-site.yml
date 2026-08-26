@@ -42,6 +42,10 @@ jobs:
     uses: ./.github/workflows/release-core.yml
     permissions:
       contents: write
+      # Pass-through for release-core's shipped-in notifications; the repo
+      # caller's own grant remains the outer ceiling (degrades to a warning).
+      issues: write
+      pull-requests: write
     with:
       dry_run: ${{ inputs.dry_run }}
 

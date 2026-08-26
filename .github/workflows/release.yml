@@ -27,5 +27,7 @@ jobs:
     uses: ./.github/workflows/release-only.yml
     permissions:
       contents: write
+      issues: write
+      pull-requests: write
     with:
       dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
