@@ -53,11 +53,50 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+      # The frontend install below authenticates to GitHub Packages with the
+      # job token (org-scoped deps like @lightwave-media/ui). Every tauri-app
+      # caller must grant `packages: read` alongside `contents: write`.
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Toolchain from the repo's mise.toml
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+
+      # The Tauri v2 Linux prerequisite list (v2.tauri.app/start/prerequisites)
+      # — webkit2gtk and friends. Without these the wry build fails at
+      # pkg-config on every Linux runner.
+      - name: Tauri system dependencies (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      # tauri-action runs the repo's beforeBuildCommand but installs nothing;
+      # node_modules must exist before it. Same lockfile idiom as
+      # release-node-package's publish job, plus bun (mise-action provides the
+      # package manager the repo's mise.toml pins).
+      - name: Install frontend dependencies
+        working-directory: ${{ inputs.tauri_project_path }}
+        env:
+          # .npmrc resolves org-scoped registries through this token.
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          else echo "::error::No lockfile — a release without one is not reproducible."; exit 1
+          fi
 
       - name: Build + attach bundles to the existing Release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
