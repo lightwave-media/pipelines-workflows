@@ -26,6 +26,12 @@ on:
       NODE_AUTH_TOKEN:
         description: "Registry token for the frontend install (org PAT via `secrets: inherit`). Optional — falls back to the job token, which works only when the package grants the calling repo Actions access"
         required: false
+      TAURI_SIGNING_PRIVATE_KEY:
+        description: "Updater-artifact signing key (repo secret via `secrets: inherit`). Required once the repo's tauri.conf.json sets createUpdaterArtifacts — the bundler refuses to build updater artifacts unsigned"
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        description: "Password for the signing key. Optional — omit for a passwordless key"
+        required: false
 
 permissions: {}
 
@@ -113,6 +119,12 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater-artifact signing (repos with createUpdaterArtifacts).
+          # tauri-action also uploads the .sig files and the latest.json
+          # manifest (uploadUpdaterJson defaults true at the pinned SHA), which
+          # is what the in-app updater polls via releases/latest/download.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: ${{ inputs.tauri_project_path }}
           tagName: ${{ needs.release.outputs.tag }}
