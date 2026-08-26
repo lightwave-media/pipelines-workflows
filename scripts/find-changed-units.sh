@@ -54,6 +54,33 @@ find_unit_for_file() {
   done
 }
 
+# Root-level HCL (root.hcl, any top-level *.hcl) is include()'d by every
+# unit, so a change there affects all of them while living under none of
+# them — the working_directory-scoped diff below cannot see it at all.
+# Detect it with an UNSCOPED diff; on a hit, report every unit under the
+# cwd subtree instead of the (empty) mapped set. Recovered from
+# lightwave-infrastructure-live's retired detect-changes fix (7cd725f),
+# re-implemented here because change detection now lives in the plane.
+if git diff --name-only "${SOURCE_REF}" "${TARGET_REF}" 2>/dev/null | grep -qE '^[^/]+\.hcl$'; then
+  echo "root-level HCL changed — reporting every unit under $(pwd)" >&2
+  REL_PREFIX="$(git rev-parse --show-prefix)"
+  find . -name "terragrunt.hcl" \
+    -not -path "*/.terragrunt-cache/*" \
+    -not -path "*/boilerplate/*" \
+    -exec dirname {} \; | \
+    sed -e "s|^\./||" -e "s|^|${REL_PREFIX}|" | \
+    sort -u | \
+    jq -c -R -s '
+      split("\n")
+      | map(select(. != ""))
+      | map({
+          id: (gsub("/"; "-")),
+          path: .
+        })
+    '
+  exit 0
+fi
+
 # Get changed files, find their owning unit, deduplicate, emit JSON.
 # Callers cd into working_directory before invoking this; `-- .` limits the diff
 # to that subtree (so plan-prod only sees prod/us-east-1, etc.) while git still
