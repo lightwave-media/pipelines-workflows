@@ -45,6 +45,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # For the shipped-in feedback loop below. Callers that grant only
+      # contents:write still work — the notify step degrades to a warning.
+      issues: write
+      pull-requests: write
     outputs:
       version: ${{ steps.derive.outputs.version }}
       tag: ${{ steps.derive.outputs.tag }}
@@ -150,6 +154,42 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" --notes-file /tmp/notes.md --verify-tag "${FLAGS[@]}"
           fi
+
+      # ── Close the feedback loop ──────────────────────────────────────
+      # Every squash-merge subject carries its PR number `(#N)`, and PRs
+      # carry `Closes #M` for the issues they fix. Commenting "shipped in
+      # <tag>" on each referenced PR (GitHub threads it to the linked
+      # issues' timelines) tells the REQUESTING agent its fix is now
+      # consumable — the return half of the issue → PR → release loop.
+      # Idempotent: a marker search skips numbers already notified for this
+      # tag, so re-runs never double-comment.
+      - name: Notify shipped PRs and issues
+        if: ${{ !inputs.dry_run }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.derive.outputs.tag }}
+        run: |
+          set -euo pipefail
+          RELEASE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          MARKER="shipped-in:${TAG}"
+          # PR numbers from squash subjects in this release's range.
+          PREFIX="${TAG%/*}"; [ "$PREFIX" = "$TAG" ] && PREFIX=""
+          PREV=$(git tag -l "${PREFIX:+$PREFIX/}v*" --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
+          RANGE="${PREV:+$PREV..}HEAD"
+          NUMS=$(git log --format=%s $RANGE | grep -oE '\(#[0-9]+\)$' | tr -d '(#)' | sort -un)
+          [ -z "$NUMS" ] && { echo "no PR-referencing commits in $RANGE"; exit 0; }
+          for n in $NUMS; do
+            if gh api "repos/${GITHUB_REPOSITORY}/issues/${n}/comments" --paginate                  --jq '.[].body' 2>/dev/null | grep -q "$MARKER"; then
+              echo "#${n}: already notified for ${TAG}"
+              continue
+            fi
+            if gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${n}/comments"                  -f body="🚀 Shipped in [\`${TAG}\`](${RELEASE_URL}). <!-- ${MARKER} -->" > /dev/null 2>&1; then
+              echo "#${n}: notified"
+            else
+              echo "::warning::Could not comment on #${n} — grant issues:write + pull-requests:write in the caller's release job to enable shipped-in notifications."
+            fi
+          done
 
       - name: Dry run — Release skipped
         if: ${{ inputs.dry_run }}
