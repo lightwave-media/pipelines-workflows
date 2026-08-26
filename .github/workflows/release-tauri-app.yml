@@ -22,6 +22,10 @@ on:
         description: "Path containing src-tauri/"
         type: string
         default: "."
+    secrets:
+      NODE_AUTH_TOKEN:
+        description: "Registry token for the frontend install (org PAT via `secrets: inherit`). Optional — falls back to the job token, which works only when the package grants the calling repo Actions access"
+        required: false
 
 permissions: {}
 
@@ -92,8 +96,11 @@ jobs:
       - name: Install frontend dependencies
         working-directory: ${{ inputs.tauri_project_path }}
         env:
-          # .npmrc resolves org-scoped registries through this token.
-          NODE_AUTH_TOKEN: ${{ github.token }}
+          # .npmrc resolves org-scoped registries through this token. The org
+          # NODE_AUTH_TOKEN secret (via the caller's `secrets: inherit`) wins;
+          # the bare job token 403'd on createOS's first run because the
+          # package had not granted that repo Actions access.
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           if [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile
