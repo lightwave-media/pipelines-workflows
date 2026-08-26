@@ -1,0 +1,3 @@
+# Machine-local validity-contract marker (per-cwd pointer into ~/.lightwave);
+# never repo content. Committed once by accident in #10.
+.lightwave/
