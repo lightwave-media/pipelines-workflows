@@ -22,6 +22,20 @@ on:
         description: "Path containing src-tauri/"
         type: string
         default: "."
+      # PRIVATE-SOURCE, PUBLIC-FEED: a private repo's release assets are not
+      # fetchable unauthenticated, so an in-app updater polling them gets 404s.
+      # Set both mirror_* inputs to publish the bundles, .sig files, and
+      # latest.json to a PUBLIC repo instead (release-core's Release on the
+      # source repo keeps the canonical notes; its body is copied onto the
+      # mirror Release so users still see a changelog).
+      mirror_owner:
+        description: "Owner of the public mirror repo for release assets. Empty = attach assets to this repo's Release"
+        type: string
+        default: ""
+      mirror_repo:
+        description: "Name of the public mirror repo. Requires RELEASE_MIRROR_TOKEN"
+        type: string
+        default: ""
     secrets:
       NODE_AUTH_TOKEN:
         description: "Registry token for the frontend install (org PAT via `secrets: inherit`). Optional — falls back to the job token, which works only when the package grants the calling repo Actions access"
@@ -31,6 +45,9 @@ on:
         required: false
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
         description: "Password for the signing key. Optional — omit for a passwordless key"
+        required: false
+      RELEASE_MIRROR_TOKEN:
+        description: "Fine-grained PAT with contents read/write on the mirror repo only. Required when mirror_owner/mirror_repo are set"
         required: false
 
 permissions: {}
@@ -115,10 +132,38 @@ jobs:
           else echo "::error::No lockfile — a release without one is not reproducible."; exit 1
           fi
 
-      - name: Build + attach bundles to the existing Release
+      # Idempotent and matrix-race-safe (same keep-existing idiom as
+      # release-core): whichever OS leg arrives first creates the mirror
+      # Release, carrying the
+      # source Release's git-cliff notes so the public feed has a changelog.
+      # tauri-action then finds it by tag and uploads into it — releaseCommitish
+      # never comes into play, which matters because the source SHA does not
+      # exist in the mirror repo.
+      - name: Ensure the mirror Release exists (public updater feed)
+        if: ${{ inputs.mirror_repo != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_MIRROR_TOKEN }}
+          SRC_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+          MIRROR: ${{ inputs.mirror_owner }}/${{ inputs.mirror_repo }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$MIRROR" > /dev/null 2>&1; then
+            echo "mirror release $TAG already exists — leaving it (keep-existing)."
+            exit 0
+          fi
+          GH_TOKEN="$SRC_TOKEN" gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq .body > /tmp/mirror-notes.md || : > /tmp/mirror-notes.md
+          gh release create "$TAG" --repo "$MIRROR" --title "$TAG" \
+            --notes-file /tmp/mirror-notes.md
+
+      - name: Build + attach bundles to the Release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # With a mirror configured, tauri-action talks to the MIRROR repo and
+          # needs the PAT; latest.json then carries mirror URLs, which is the
+          # whole point — a public feed for apps built from private source.
+          GITHUB_TOKEN: ${{ inputs.mirror_repo != '' && secrets.RELEASE_MIRROR_TOKEN || secrets.GITHUB_TOKEN }}
           # Updater-artifact signing (repos with createUpdaterArtifacts).
           # tauri-action also uploads the .sig files and the latest.json
           # manifest (uploadUpdaterJson defaults true at the pinned SHA), which
@@ -129,6 +174,9 @@ jobs:
           projectPath: ${{ inputs.tauri_project_path }}
           tagName: ${{ needs.release.outputs.tag }}
           releaseDraft: false
+          # Empty strings fall back to the calling repo inside the action.
+          owner: ${{ inputs.mirror_owner }}
+          repo: ${{ inputs.mirror_repo }}
 
   dry-run-note:
     name: Dry run — bundles skipped
