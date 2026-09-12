@@ -100,6 +100,8 @@ jobs:
 
       - name: Setup toolchain (mise)
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.9.5  # pinned: unset resolves LATEST mid-publish (lightwave-core#474)
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
