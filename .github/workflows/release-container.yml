@@ -99,6 +99,8 @@ jobs:
       - name: Toolchain from the repo's mise.toml
         if: ${{ inputs.deploy_task != '' && !inputs.dry_run }}
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.5  # pinned: unset resolves LATEST mid-publish (lightwave-core#474)
 
       - name: Repo deploy task
         if: ${{ inputs.deploy_task != '' && !inputs.dry_run }}
