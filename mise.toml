@@ -8,9 +8,10 @@ actionlint = "1.7.7"
 shellcheck = "0.11.0"
 
 [tasks.ci]
-description = "THE CI gate: actionlint over every workflow + shellcheck over scripts/"
+description = "THE CI gate: actionlint + shellcheck + third-party actions SHA-pinned"
 run = """
 SHELLCHECK_OPTS="--severity=warning" actionlint
 shellcheck --severity=warning scripts/*.sh
+bash scripts/check-actions-pinned.sh
 echo "plane CI green"
 """
