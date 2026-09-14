@@ -12,6 +12,7 @@ description = "THE CI gate: actionlint + shellcheck + third-party actions SHA-pi
 run = """
 SHELLCHECK_OPTS="--severity=warning" actionlint
 shellcheck --severity=warning scripts/*.sh
+bash scripts/check-actions-pinned-test.sh
 bash scripts/check-actions-pinned.sh
 echo "plane CI green"
 """
