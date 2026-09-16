@@ -2,7 +2,7 @@ name: release-go-binary
 
 # Tag → Release (release-core) → GoReleaser build + publish.
 # Mirrors lightwave-cli's proven flow (same action SHAs, same GoReleaser
-# version, same tap-token minting). The repo's .goreleaser.yaml must set
+# version). The repo's .goreleaser.yaml must set
 # `release.mode: keep-existing` — release-core creates the Release with
 # git-cliff notes and GoReleaser attaches artifacts to it.
 
@@ -50,10 +50,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      # secrets context is not legal in `if` expressions at any level; job env
-      # is, so presence is computed here and tested below.
-      HAS_TAP_APP: ${{ secrets.TAP_APP_ID != '' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -63,26 +59,27 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Short-lived installation token for the tap-publisher GitHub App,
-      # scoped to homebrew-tap; auto-rotates per run. Only minted when the
-      # repo carries the TAP_APP_* secrets (lightwave-cli does).
-      - name: Mint tap-push token
-        id: tap-token
-        if: ${{ !inputs.dry_run && env.HAS_TAP_APP == 'true' }}
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-        with:
-          app-id: ${{ secrets.TAP_APP_ID }}
-          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
-          owner: lightwave-media
-          repositories: homebrew-tap
-
+      # A `Mint tap-push token` step stood here, minting a GitHub App token
+      # scoped to `repositories: homebrew-tap` and passing it to GoReleaser as
+      # HOMEBREW_TAP_TOKEN for the `brews:` block to push a formula.
+      #
+      # lightwave-media/homebrew-tap was DELETED on 2026-09-16. The step was
+      # guarded on the TAP_APP_* secrets being present rather than on the tap
+      # existing, and those secrets are still set on lightwave-cli — so the
+      # guard stayed true and the next real release would have tried to scope a
+      # token to a repository that does not resolve. A guard on the wrong
+      # condition is not a guard.
+      #
+      # lightwave-cli dropped its `brews:` block in lightwave-cli#486, so there
+      # is nothing left to push even if the token minted. Tagged releases still
+      # publish cross-platform tarballs to the GitHub Release, which is how
+      # other machines get the binary.
       - uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7
         with:
           version: ${{ inputs.goreleaser_version }}
           args: release --clean ${{ inputs.dry_run && '--skip=publish,announce' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
 
       # Darwin binaries for the repo's own notarization workflow, if any
       # (lightwave-cli's sign-macos.yml). Harmless when unused; expire in 7d.
