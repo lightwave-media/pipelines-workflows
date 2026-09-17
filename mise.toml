@@ -6,13 +6,16 @@
 [tools]
 actionlint = "1.7.7"
 shellcheck = "0.11.0"
+git-cliff = "2.11.0"
 
 [tasks.ci]
-description = "THE CI gate: actionlint + shellcheck + third-party actions SHA-pinned"
+description = "THE CI gate: actionlint + shellcheck + action pins + release-note regressions"
 run = """
+set -eu
 SHELLCHECK_OPTS="--severity=warning" actionlint
 shellcheck --severity=warning scripts/*.sh
 bash scripts/check-actions-pinned-test.sh
 bash scripts/check-actions-pinned.sh
+python3 scripts/test-release-notes.py
 echo "plane CI green"
 """
