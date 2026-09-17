@@ -97,10 +97,13 @@ jobs:
         env:
           TAG: ${{ steps.derive.outputs.tag }}
         run: |
+          # BEGIN RELEASE NOTES HELPER (executed verbatim by local CI)
           set -euo pipefail
+          export NOTES_DIR="$RUNNER_TEMP/release-notes"
+          mkdir -p "$NOTES_DIR"
           # One config for the whole org, inlined so every repo's notes are
           # produced by identical bytes. Change it here, nowhere else.
-          tee /tmp/cliff.toml > /dev/null <<'CLIFF'
+          tee "$NOTES_DIR/cliff.toml" > /dev/null <<'CLIFF'
           [changelog]
           header = ""
           body = """
@@ -128,11 +131,80 @@ jobs:
             { message = "^chore\\(main\\): release", skip = true },
             { message = ".*", group = "Other" },
           ]
-          tag_pattern = "v[0-9].*"
           CLIFF
-          mise x git-cliff@2.11.0 -- git-cliff --config /tmp/cliff.toml --current --tag "$TAG" -o /tmp/notes.md
+          python3 - <<'PY'
+          import glob
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          from urllib.parse import quote
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          tag = os.environ["TAG"]
+          prefix = tag.rsplit("/", 1)[0] + "/" if "/" in tag else ""
+          # Start at the target's parent, not HEAD or the newest tag in the
+          # repository: a rerun must not include a later release's commits.
+          target = git("rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}")
+          parent = subprocess.run(
+              ["git", "rev-parse", "--verify", f"{target}^"],
+              capture_output=True, text=True,
+          )
+          previous = ""
+          if parent.returncode == 0:
+              described = subprocess.run(
+                  ["git", "describe", "--tags", "--abbrev=0",
+                   "--match", glob.escape(prefix) + "v[0-9]*",
+                   "--exclude", glob.escape(prefix) + "v*/*", parent.stdout.strip()],
+                  capture_output=True, text=True,
+              )
+              if described.returncode == 0:
+                  previous = described.stdout.strip()
+              elif described.returncode != 128:
+                  raise RuntimeError(described.stderr)
+          revision_range = f"{previous}..{target}" if previous else target
+          notes_dir = Path(os.environ["NOTES_DIR"])
+          full_notes = notes_dir / "full-notes.md"
+          subprocess.run(
+              ["mise", "x", "git-cliff@2.11.0", "--", "git-cliff",
+               "--config", str(notes_dir / "cliff.toml"),
+               "--tag-pattern", "^" + re.escape(prefix) + r"v[0-9].*$",
+               "--tag", tag, "--output", str(full_notes), revision_range],
+              check=True,
+          )
+          repository_url = os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"]
+          if previous:
+              history_url = repository_url + "/compare/" + quote(previous, safe="") + "..." + quote(tag, safe="")
+          else:
+              history_url = repository_url + "/commits/" + quote(tag, safe="")
+          full_body = full_notes.read_text(encoding="utf-8")
+          # GitHub rejects bodies over 125000 characters. A stricter byte
+          # ceiling also covers Unicode and leaves room below that limit.
+          limit = 120000
+          footer = f"\n\n[Full commit history]({history_url})\n"
+          body = full_body + footer
+          if len(body.encode("utf-8")) > limit:
+              footer = "\n\nRelease notes abbreviated to fit GitHub's limit." + footer
+              budget = limit - len(footer.encode("utf-8"))
+              excerpt = full_body.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+              # Prefer complete lines; a single oversized commit message
+              # still gets a bounded excerpt and an explicit notice.
+              if "\n" in excerpt:
+                  excerpt = excerpt.rsplit("\n", 1)[0]
+              body = excerpt + footer
+          if len(body.encode("utf-8")) > limit:
+              raise RuntimeError("release notes still exceed the publication limit")
+          (notes_dir / "notes.md").write_text(body, encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"range={revision_range}\n")
+              output.write(f"path={notes_dir / 'notes.md'}\n")
+          print(f"Validated {len(body.encode('utf-8'))} note bytes for {revision_range}")
+          PY
           echo "── notes ──"
-          tee /dev/stderr < /tmp/notes.md > /dev/null
+          tee /dev/stderr < "$NOTES_DIR/notes.md" > /dev/null
+          # END RELEASE NOTES HELPER
 
       - name: Create GitHub Release
         if: ${{ !inputs.dry_run }}
@@ -141,6 +213,7 @@ jobs:
           TAG: ${{ steps.derive.outputs.tag }}
           VERSION: ${{ steps.derive.outputs.version }}
           PRERELEASE: ${{ inputs.prerelease }}
+          NOTES_PATH: ${{ steps.notes.outputs.path }}
         run: |
           set -euo pipefail
           FLAGS=()
@@ -153,7 +226,7 @@ jobs:
             # the :- form expanded to one EMPTY STRING positional, which
             # gh treated as a file pattern: `no matches found for ''`.
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "$TAG" --notes-file /tmp/notes.md --verify-tag "${FLAGS[@]}"
+              --title "$TAG" --notes-file "$NOTES_PATH" --verify-tag "${FLAGS[@]}"
           fi
 
       # ── Close the feedback loop ──────────────────────────────────────
@@ -170,15 +243,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.derive.outputs.tag }}
+          RANGE: ${{ steps.notes.outputs.range }}
         run: |
           set -euo pipefail
           RELEASE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
           MARKER="shipped-in:${TAG}"
           # PR numbers from squash subjects in this release's range.
-          PREFIX="${TAG%/*}"; [ "$PREFIX" = "$TAG" ] && PREFIX=""
-          PREV=$(git tag -l "${PREFIX:+$PREFIX/}v*" --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
-          RANGE="${PREV:+$PREV..}HEAD"
-          NUMS=$(git log --format=%s $RANGE | grep -oE '\(#[0-9]+\)$' | tr -d '(#)' | sort -un)
+          NUMS=$(git log --format=%s "$RANGE" | { grep -oE '\(#[0-9]+\)$' || true; } | tr -d '(#)' | sort -un)
           [ -z "$NUMS" ] && { echo "no PR-referencing commits in $RANGE"; exit 0; }
           for n in $NUMS; do
             if gh api "repos/${GITHUB_REPOSITORY}/issues/${n}/comments" --paginate                  --jq '.[].body' 2>/dev/null | grep -q "$MARKER"; then
