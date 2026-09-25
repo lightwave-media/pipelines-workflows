@@ -14,6 +14,23 @@ HELPER = textwrap.dedent(
     WORKFLOW_TEXT.split("# BEGIN RELEASE NOTES HELPER (executed verbatim by local CI)\n", 1)[1]
     .split("          # END RELEASE NOTES HELPER", 1)[0]
 )
+# Every git this suite spawns, directly or through HELPER, runs in this
+# environment. git exports GIT_DIR and GIT_INDEX_FILE to its hooks and neither
+# cwd nor -C outranks them, and `git config` honours GIT_CONFIG, so an inherited
+# selector would build the fixture in the repo that set it. Identity travels as
+# environment because `git config user.*` is a write, and a write lands
+# wherever git resolves the repo. scripts/fixture-isolation-test.sh proves it.
+GIT_REPO_SELECTORS = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG",
+)
+FIXTURE_GIT_ENV = {
+    **{key: value for key, value in os.environ.items() if key not in GIT_REPO_SELECTORS},
+    "GIT_AUTHOR_NAME": "Release Test",
+    "GIT_AUTHOR_EMAIL": "release-test@example.com",
+    "GIT_COMMITTER_NAME": "Release Test",
+    "GIT_COMMITTER_EMAIL": "release-test@example.com",
+}
 
 
 class ReleaseNotesTest(unittest.TestCase):
@@ -26,14 +43,12 @@ class ReleaseNotesTest(unittest.TestCase):
         self.runner_temp.mkdir()
         self.output = self.runner_temp / "output"
         self.git("init", "--quiet")
-        self.git("config", "user.name", "Release Test")
-        self.git("config", "user.email", "release-test@example.com")
-        self.git("config", "commit.gpgsign", "false")
-        self.git("config", "tag.gpgsign", "false")
 
     def git(self, *args, input=None):
+        # Signing is disabled in command scope, never written to a config file.
         return subprocess.check_output(
-            ["git", *args], cwd=self.repo, text=True, input=input, stderr=subprocess.PIPE
+            ["git", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+            cwd=self.repo, env=FIXTURE_GIT_ENV, text=True, input=input, stderr=subprocess.PIPE,
         ).strip()
 
     def commit(self, subject):
@@ -44,7 +59,7 @@ class ReleaseNotesTest(unittest.TestCase):
         self.output.write_text("", encoding="utf-8")
         result = subprocess.run(
             ["bash", "-c", HELPER], cwd=self.repo, capture_output=True, text=True,
-            env={**os.environ, "TAG": tag, "RUNNER_TEMP": str(self.runner_temp),
+            env={**FIXTURE_GIT_ENV, "TAG": tag, "RUNNER_TEMP": str(self.runner_temp),
                  "GITHUB_OUTPUT": str(self.output), "GITHUB_SERVER_URL": "https://github.com",
                  "GITHUB_REPOSITORY": "example/consumer"},
         )
