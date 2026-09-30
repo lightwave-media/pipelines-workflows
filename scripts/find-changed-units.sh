@@ -75,6 +75,9 @@ if git diff --name-only "${SOURCE_REF}" "${TARGET_REF}" 2>/dev/null | grep -qE '
       | map(select(. != ""))
       | map({
           id: (gsub("/"; "-")),
+          # role-session-name budget: AWS caps it at 64; the longest prefix,
+          # "GitHubActions-PreApplyPlan-", is 27. id stays whole for artifact names.
+          session: (gsub("/"; "-") | .[0:37]),
           path: .
         })
     '
@@ -96,6 +99,9 @@ git diff --name-only "${SOURCE_REF}" "${TARGET_REF}" -- . 2>/dev/null | \
     | map(select(. != ""))
     | map({
         id: (gsub("/"; "-")),
+        # role-session-name budget: AWS caps it at 64; the longest prefix,
+        # "GitHubActions-PreApplyPlan-", is 27. id stays whole for artifact names.
+        session: (gsub("/"; "-") | .[0:37]),
         path: .
       })
   '

@@ -100,7 +100,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: "GitHubActions-PreApplyPlan-${{ matrix.unit.id }}"
+          role-session-name: "GitHubActions-PreApplyPlan-${{ matrix.unit.session }}"
 
       - name: Fetch Cloudflare token from SSM
         shell: bash
@@ -162,7 +162,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: "GitHubActions-Apply-${{ matrix.unit.id }}"
+          role-session-name: "GitHubActions-Apply-${{ matrix.unit.session }}"
 
       - name: Fetch Cloudflare token from SSM
         shell: bash
