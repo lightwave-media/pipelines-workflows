@@ -82,6 +82,18 @@ classify iam 2 "$TMP/iam.txt"
 expect iam drifted true
 expect iam severity critical
 
+# (c2) An IAM user and its inline policy are security resources too. Drift
+#      run 36915944668 scored infra-live's joelschaeffer-contact-ses
+#      (aws_iam_user + aws_iam_user_policy to create) as acceptable.
+{
+  line "  # aws_iam_user.this will be created"
+  line "  # aws_iam_user_policy.inline[\"ses-send\"] will be created"
+  line "Plan: 2 to add, 0 to change, 0 to destroy."
+} > "$TMP/iam-user.txt"
+classify iam-user 2 "$TMP/iam-user.txt"
+expect iam-user severity critical
+expect iam-user resources_add 2
+
 # (d) A destroy of a non-security resource is high, and an IAM name appearing
 #     only in plan text (not as a changed resource) does not make it critical.
 {
