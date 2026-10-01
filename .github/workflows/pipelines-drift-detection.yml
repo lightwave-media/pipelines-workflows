@@ -142,10 +142,14 @@ jobs:
       - name: Classify drift severity
         id: classify
         shell: bash
+        # Inputs arrive through env, not ${{ }} in the script, so
+        # scripts/classify-drift-test.sh can run this exact block against
+        # fixture plans.
+        env:
+          PLAN_EXIT: ${{ steps.plan.outputs.plan_exit }}
+          PLAN_FILE: /tmp/drift/${{ matrix.unit.id }}/plan.txt
+          UNIT_PATH: ${{ matrix.unit.path }}
         run: |
-          PLAN_EXIT="${{ steps.plan.outputs.plan_exit }}"
-          PLAN_FILE="/tmp/drift/${{ matrix.unit.id }}/plan.txt"
-
           if [[ "$PLAN_EXIT" == "1" ]]; then
             echo "severity=error" >> "$GITHUB_OUTPUT"
             echo "drifted=false" >> "$GITHUB_OUTPUT"
@@ -158,11 +162,17 @@ jobs:
             exit 0
           fi
 
-          # PLAN_EXIT == 2: changes present — classify severity
-          ADD=$(grep -c "will be created" "$PLAN_FILE" 2>/dev/null || echo 0)
-          CHANGE=$(grep -c "will be updated in-place" "$PLAN_FILE" 2>/dev/null || echo 0)
-          DESTROY=$(grep -c "will be destroyed" "$PLAN_FILE" 2>/dev/null || echo 0)
-          REPLACE=$(grep -c "must be replaced" "$PLAN_FILE" 2>/dev/null || echo 0)
+          # PLAN_EXIT == 2: changes present — classify severity.
+          # Count the per-resource header lines ("# <address> will be …"),
+          # with terragrunt's ANSI colouring removed. `grep -c` prints 0 AND
+          # exits 1 on no match, so `|| echo 0` used to yield "0\n0" and the
+          # arithmetic below died; awk always prints exactly one integer.
+          HEADERS=$(sed -E 's/\x1b\[[0-9;]*m//g' "$PLAN_FILE" 2>/dev/null | grep -E '# [^ ]+ (will be|must be)' || true)
+          count() { awk -v pat="$1" 'index($0, pat) {n++} END {print n+0}' <<<"$HEADERS"; }
+          ADD=$(count "will be created")
+          CHANGE=$(count "will be updated in-place")
+          DESTROY=$(count "will be destroyed")
+          REPLACE=$(count "must be replaced")
           TOTAL=$((ADD + CHANGE + DESTROY + REPLACE))
 
           echo "resources_add=$ADD" >> "$GITHUB_OUTPUT"
@@ -177,20 +187,20 @@ jobs:
           if [[ $DESTROY -gt 0 || $REPLACE -gt 0 ]]; then
             SEVERITY="high"
           fi
-          # Critical: security-related resources destroyed/replaced
-          if grep -qE "aws_security_group|aws_iam_role|aws_iam_policy|aws_kms_key|aws_network_acl" "$PLAN_FILE"; then
-            if grep -qE "will be destroyed|must be replaced" "$PLAN_FILE"; then
-              SEVERITY="critical"
-            fi
+          # Critical: a security resource is itself in the change set. Judged
+          # per resource header, so an unrelated destroy next to a mention of
+          # an IAM role elsewhere in the plan text no longer reads as critical.
+          if grep -qE '# [^ ]*(aws_security_group|aws_iam_role|aws_iam_policy|aws_kms_key|aws_network_acl|aws_iam_openid_connect_provider)[^ ]* ' <<<"$HEADERS"; then
+            SEVERITY="critical"
           fi
 
           echo "severity=$SEVERITY" >> "$GITHUB_OUTPUT"
 
           # Warning annotation
           case "$SEVERITY" in
-            critical) echo "::error::Critical drift in ${{ matrix.unit.path }} — security resources affected" ;;
-            high)     echo "::warning::High drift in ${{ matrix.unit.path }} — resources will be destroyed/replaced" ;;
-            *)        echo "::notice::Acceptable drift in ${{ matrix.unit.path }} ($TOTAL change(s))" ;;
+            critical) echo "::error::Critical drift in $UNIT_PATH — security resources affected" ;;
+            high)     echo "::warning::High drift in $UNIT_PATH — resources will be destroyed/replaced" ;;
+            *)        echo "::notice::Acceptable drift in $UNIT_PATH ($TOTAL change(s))" ;;
           esac
 
       - name: Generate JSON report
