@@ -9,7 +9,7 @@ shellcheck = "0.11.0"
 git-cliff = "2.11.0"
 
 [tasks.ci]
-description = "THE CI gate: actionlint + shellcheck + action pins + release-note regressions + fixture isolation + role-session-name length"
+description = "THE CI gate: actionlint + shellcheck + action pins + release-note regressions + fixture isolation + role-session-name length + drift classifier"
 run = """
 set -eu
 SHELLCHECK_OPTS="--severity=warning" actionlint
@@ -19,5 +19,6 @@ bash scripts/check-actions-pinned.sh
 python3 scripts/test-release-notes.py
 bash scripts/fixture-isolation-test.sh
 bash scripts/role-session-name-test.sh
+bash scripts/classify-drift-test.sh
 echo "plane CI green"
 """
