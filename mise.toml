@@ -20,5 +20,6 @@ python3 scripts/test-release-notes.py
 bash scripts/fixture-isolation-test.sh
 bash scripts/role-session-name-test.sh
 bash scripts/classify-drift-test.sh
+bash scripts/drop-drift-ignored-test.sh
 echo "plane CI green"
 """

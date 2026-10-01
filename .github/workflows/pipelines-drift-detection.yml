@@ -59,7 +59,7 @@ jobs:
     name: Discover All Units
     runs-on: ${{ fromJSON(inputs.runner) }}
     outputs:
-      units: ${{ steps.discover.outputs.units }}
+      units: ${{ steps.drop-ignored.outputs.units }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -79,6 +79,36 @@ jobs:
           COUNT=$(echo "$UNITS" | jq 'length')
           echo "Discovered $COUNT units:"
           echo "$UNITS" | jq .
+
+      # A unit opts out of drift detection with a `.drift-ignore` file in its
+      # directory whose first non-comment line is the reason. Drift only: plan,
+      # apply and unlock never read the marker. An empty reason fails the run:
+      # an opt-out nobody can explain is drift hidden, not drift accepted.
+      # Inline (not a script) because scripts here run from the CONSUMER's
+      # checkout, and copied scripts drift; scripts/drop-drift-ignored-test.sh
+      # runs this exact block.
+      - name: Drop units opted out of drift
+        id: drop-ignored
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          UNITS: ${{ steps.discover.outputs.units }}
+        run: |
+          keep='[]'
+          while IFS= read -r unit; do
+            path=$(jq -r '.path' <<<"$unit")
+            if [ ! -f "$path/.drift-ignore" ]; then
+              keep=$(jq -c --argjson u "$unit" '. + [$u]' <<<"$keep")
+              continue
+            fi
+            reason=$(grep -v -E '^[[:space:]]*(#|$)' "$path/.drift-ignore" | head -1 || true)
+            if [ -z "$reason" ]; then
+              echo "::error::$path/.drift-ignore has no reason; write why this unit is exempt from drift detection"
+              exit 1
+            fi
+            echo "::notice::Drift not checked for $path: $reason"
+          done < <(jq -c '.[]' <<<"$UNITS")
+          echo "units=$keep" >> "$GITHUB_OUTPUT"
 
   plan:
     name: "Drift — ${{ matrix.unit.path }}"
