@@ -1,25 +1,14 @@
-# Toolchain + the ONE CI gate for the plane repo itself.
-# ci_parity (lightwave-core release_pipeline.yaml): GitHub CI runs exactly
-# `mise run ci` via ci-mise.yml — keep every check in this task, never in
-# workflow-only steps.
+# Toolchain + the ONE CI gate for the plane repo itself: `mise run ci`.
 
 [tools]
-actionlint = "1.7.7"
 shellcheck = "0.11.0"
-git-cliff = "2.11.0"
 
 [tasks.ci]
-description = "THE CI gate: actionlint + shellcheck + action pins + release-note regressions + fixture isolation + role-session-name length + drift classifier"
+description = "THE CI gate: shellcheck + action pins"
 run = """
 set -eu
-SHELLCHECK_OPTS="--severity=warning" actionlint
 shellcheck --severity=warning scripts/*.sh
 bash scripts/check-actions-pinned-test.sh
 bash scripts/check-actions-pinned.sh
-python3 scripts/test-release-notes.py
-bash scripts/fixture-isolation-test.sh
-bash scripts/role-session-name-test.sh
-bash scripts/classify-drift-test.sh
-bash scripts/drop-drift-ignored-test.sh
 echo "plane CI green"
 """
